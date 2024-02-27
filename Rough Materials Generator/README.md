@@ -7,4 +7,4 @@ Place the script into your game folder.
 
 # How to use:
 - To see a step-by-step demonstration and learn how to use the script effectively, please watch the following video.
-- [Demo Video 1]([https://youtu.be/EywA7nKUMdw](https://youtu.be/dVQgJkJEG14))
+- [Demo Video 1](https://youtu.be/dVQgJkJEG14)
