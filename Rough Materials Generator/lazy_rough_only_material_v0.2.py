@@ -583,10 +583,9 @@ def saveFile():
     
     root.iconify()
     
-    if changed:
-        loadignorelist()
-        save()
-        changed = False
+    loadignorelist()
+    save()
+    changed = False
     
 def main():
     global dirname, gamefolder, modfolder, gamefolder_entry, modfolder_entry, ignorFolder_entry, root, clipboard_value
