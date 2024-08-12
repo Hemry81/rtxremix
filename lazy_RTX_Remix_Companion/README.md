@@ -28,16 +28,16 @@ This tool automates the process of updating game directories with the latest RTX
 3. **Run the Script**: Execute the script using Python from your command line or terminal.
 
 ## Frequently Asked Questions
-**Q**: Can I use the script standalone without "RTX Remix Downloader"?
+**Q: Can I use the script standalone without "RTX Remix Downloader"?**  
 **A**: *No, the script depends on the RTX Remix Downloader for file downloads and version validation.*
 
-**Q**: What are the advantages of this script compared to community scripts?
+**Q: What are the advantages of this script compared to community scripts?**  
 **A**: *This script offers version validation and allows selective file copying with options to temporarily disable copying for compatibility purposes.*
 
-**Q**: What features are planned for future updates?
+**Q: What features are planned for future updates?**  
 **A**: *Planned enhancements include auto-renaming of d3d8to9.dll to d3d8.dll and the ability to rename d3d9.dll to other names like remix.asi.*
 
-**Q**: Why was this script developed?
+**Q: Why was this script developed?**  
 **A**: *As suggested by its name, Lazy RTX Remix Companion was created to simplify the process of updating multiple game directories with RTX-Remix files, avoiding the repetitive manual effort.*
 
 ## Contributing
