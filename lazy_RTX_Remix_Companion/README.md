@@ -14,7 +14,7 @@ This tool automates the process of updating game directories with the latest RTX
 
 ## How to Use
 
-1. **Download Files**: Use the RTX Remix Downloader to download all necessary files first.
+1. **Download Files**: Use the [RTX Remix Downloader](https://github.com/Kim2091/RTX-Remix-Downloader/releases/latest/download/RTX.Remix.Downloader.exe) to download all necessary files first.
 2. **Select RTX-Remix Folder**: Click the "Select RTX-Remix" button to choose the downloaded RTX-Remix files (default folder is named "remix").
 3. **Add Game Folder**: Click "Add Game Folder" to add a game directory to the list.
 4, **Configure Names**: Upon folder selection, the script auto-generates or allows you to input the game name.
