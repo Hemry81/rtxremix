@@ -29,7 +29,7 @@ This tool automates the process of updating game directories with the latest RTX
 
 ## Frequently Asked Questions
 **Q: Can I use the script standalone without "RTX Remix Downloader"?**  
-**A**: *No, the script depends on the RTX Remix Downloader for file downloads and version validation.*
+**A**: *Yes, the script can handle files downloaded directly from the official RTX-Remix GitHub repo as well.*
 
 **Q: What are the advantages of this script compared to community scripts?**  
 **A**: *This script offers version validation and allows selective file copying with options to temporarily disable copying for compatibility purposes.*
