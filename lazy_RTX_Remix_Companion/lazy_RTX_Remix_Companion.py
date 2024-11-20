@@ -393,7 +393,7 @@ class lazy_rtx_remix_companion:
                 self.status_right.config(text="Invalid RTX-Remix folder selected.")
             else:
                 self.remix_folder = new_folder.replace("/", "\\")  # Update the global source folder path, Replace forward slashes with double forward slashes
-                self.source_versions = self.load_versions_from_file(self.remix_folder)
+                self.source_versions = self.load_versions_from_file(self.remix_folder, True)
                 version_info = f"RTX-Remix Version: Runtime {self.source_versions['runtime version']}, Bridge {self.source_versions['bridge version']}"
                 self.version_label.config(text=version_info)
                 self.status_left.config(text=f"RTX-Remix Folder: {self.remix_folder}")
@@ -530,7 +530,7 @@ class lazy_rtx_remix_companion:
         with open(filepath, 'w') as file:
             file.writelines('\n'.join(lines))
             
-    def load_versions_from_file(self, directory):
+    def load_versions_from_file(self, directory, isSource=False):
         versions = {"runtime version": "N/A", "bridge version": "N/A"}
         if os.path.exists(os.path.join(directory, "build-names.txt")):
             filepath = os.path.join(directory, "build-names.txt")
@@ -547,7 +547,10 @@ class lazy_rtx_remix_companion:
             return versions
         except:
             if not firstLaunch:
-                return self.show_popup_window(versions, directory)
+                if isSource:
+                    return self.show_popup_window(versions, directory)
+                else:
+                    return versions
                 
     def check_version_and_tag(self, tree_item_id, destination_versions):
         if self.remix_folder:
@@ -734,7 +737,7 @@ class lazy_rtx_remix_companion:
         if self.remix_folder:
             self.remix_folder = self.remix_folder.replace('\\', '/')
             self.status_left.config(text=f"RTX-Remix Folder: {self.remix_folder}")
-            self.source_versions = self.load_versions_from_file(self.remix_folder)
+            self.source_versions = self.load_versions_from_file(self.remix_folder, True)
             version_info = f"RTX-Remix Version: Runtime {self.source_versions['runtime version']}, Bridge {self.source_versions['bridge version']}"
             self.version_label.config(text=version_info)
         else:
