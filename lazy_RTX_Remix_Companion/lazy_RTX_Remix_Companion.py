@@ -108,7 +108,7 @@ class lazy_rtx_remix_companion:
         self.master = master
         self.master.geometry(('1280x720+100+100'))
         self.master.protocol("WM_DELETE_WINDOW", self.on_closing)
-        self.master.title("lazy_RTX-Remix Companion")
+        self.master.title(f"lazy_RTX-Remix Companion %s" % app_version)
         
         # Windows 11 progress colors
         self.progress_colors = {
