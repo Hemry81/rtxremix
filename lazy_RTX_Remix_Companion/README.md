@@ -1,44 +1,38 @@
-# Lazy RTX Remix Companion
+# RTX Remix Companion v1.0.0.reborn
 
-**Lazy RTX Remix Companion** is a Python script designed to facilitate the easy transfer of RTX-Remix Runtime/Bridge files from the [RTX Remix Downloader](https://github.com/Kim2091/RTX-Remix-Downloader/releases/latest/download/RTX.Remix.Downloader.exe) to multiple game folders.
-This tool automates the process of updating game directories with the latest RTX-Remix files, ensuring that users can maintain up-to-date enhancements with minimal effort.
+## Latest Update: v1.0.0.reborn (May 2025)
 
-## Features
+The RTX Remix Companion has been completely revamped with major improvements:
 
-- **Easy Selection**: Choose your RTX-Remix folder and game directories through a user-friendly interface.
-- **Automatic Naming**: Automatically generates game names based on selected folders or allows for custom input.
-- **File Selection**: Toggle which specific files (Bridge, Runtimes, dxvk.conf, d3d8to9.dll) to copy to the game folders.
-- **Version Checking**: Color-coded text displays whether the game’s RTX-Remix files are up-to-date.
-- **Selective Copying**: Temporarily disable copying to specific game folders, useful for avoiding compatibility issues with new versions.
-- **Bulk Actions**: Support for selecting all or deselecting all games for actions, with shortcuts for ease.
+### What's New in v1.0.0.reborn
+- **Fully Standalone**: No longer requires RTX Remix Downloader to function - includes built-in download capabilities
+- **Support for Unified RTX Remix Repository**: Compatible with the new merged RTX Remix repository structure
+- **Streamlined Installation Management**: Easily manage multiple RTX Remix builds and update games with a single click
+- **Improved Version Detection**: Automatically detects and displays runtime and bridge versions for all installations
+- **Better Performance**: Significant performance optimizations to reduce redundant operations
+- **Enhanced User Interface**: More responsive UI with clearer status indicators
+- **New Welcome Tutorial**: Helpful onboarding for new users
 
-## How to Use
+### Important Note
+This version is not backward compatible with configuration files from previous versions. When upgrading, you will need to reconfigure your RTX Remix folder and re-add your games.
 
-1. **Download Files**: Use the [RTX Remix Downloader](https://github.com/Kim2091/RTX-Remix-Downloader/releases/latest/download/RTX.Remix.Downloader.exe) to download all necessary files first.
-2. **Select RTX-Remix Folder**: Click the "Select RTX-Remix" button to choose the downloaded RTX-Remix files (default folder is named "remix").
-3. **Add Game Folder**: Click "Add Game Folder" to add a game directory to the list.
-4, **Configure Names**: Upon folder selection, the script auto-generates or allows you to input the game name.
-5. **File Preferences**: Choose which specific files you want to copy by toggling them in the interface.
-6. **Manage Game List**: Lock game folders to exclude them from copying, or remove them permanently from the list.
-7. **Copy Files**: Once satisfied with settings, press "Copy Files" to initiate the transfer of files to selected game folders.
+### Features
+- Easy management of multiple RTX Remix installations
+- One-click updating of game installations with latest RTX Remix builds
+- Support for both release and nightly builds
+- Automatic version tracking to identify which games need updates
+- Visual indicators showing update status for each game
+- Built-in RTX Remix downloader for the latest builds
+- Intelligent folder structure organization
 
-## Installation
-1. **Download the Script**: Clone or download this script to a local directory without admin permissions.
-2. **Install Python**: Ensure Python 3.8 or higher is installed, available from [Python.org](https://www.python.org/downloads/).
-3. **Run the Script**: Execute the script using Python from your command line or terminal.
+### Requirements
+- Windows 10/11
+- Python 3.8 or newer (if running from source)
+- Internet connection for downloading RTX Remix builds
 
-## Frequently Asked Questions
-**Q: Can I use the script standalone without "RTX Remix Downloader"?**  
-**A**: *Yes, the script can handle files downloaded directly from the official RTX-Remix GitHub repo as well.*
-
-**Q: What are the advantages of this script compared to community scripts?**  
-**A**: *This script offers version validation and allows selective file copying with options to temporarily disable copying for compatibility purposes.*
-
-**Q: What features are planned for future updates?**  
-**A**: *Planned enhancements include auto-renaming of d3d8to9.dll to d3d8.dll and the ability to rename d3d9.dll to other names like remix.asi.*
-
-**Q: Why was this script developed?**  
-**A**: *As suggested by its name, Lazy RTX Remix Companion was created to simplify the process of updating multiple game directories with RTX-Remix files, avoiding the repetitive manual effort.*
-
-## Contributing
-Contributions to the Lazy RTX Remix Companion are welcome! Please feel free to fork the repository, make your changes, and submit a pull request. For major changes, please open an issue first to discuss what you would like to change.
+### Getting Started
+1. Run the application
+2. Set your RTX Remix main folder when prompted
+3. Add your games through the interface
+4. Select an RTX Remix build to use
+5. Click "Copy Files" to update your installations
