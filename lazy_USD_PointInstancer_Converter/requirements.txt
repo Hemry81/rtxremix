@@ -1,0 +1,23 @@
+# Requirements for USD Point Instancer Converter
+# Core Dependencies - REQUIRED for basic functionality
+
+# USD Python library (REQUIRED) - Choose ONE of these options:
+# Option 1: Official NVIDIA USD (recommended for RTX Remix)
+usd-core>=23.0
+# Option 2: Alternative if usd-core not available
+# usd-python>=23.0
+
+# Image Processing Dependencies - REQUIRED for texture conversion
+numpy>=1.21.0
+Pillow>=8.0.0
+
+# Optional Dependencies - Enhanced functionality
+# Process monitoring for texture conversion performance
+psutil>=5.8.0
+
+# Development Dependencies (Optional)
+# pytest>=6.0.0
+# black>=21.0.0
+
+# Note: tkinter is included with most Python installations
+# If tkinter is missing, install python-tk (Linux) or ensure GUI support in Python installation
