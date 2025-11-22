@@ -6,10 +6,100 @@ Converts OmniPBR materials from MDL files to Remix-compatible USD materials
 
 import os
 import re
-from omnipbr_mapping import (
-    convert_omnipbr_to_remix,
-    get_remix_material_template
-)
+from omnipbr_mapping import convert_to_remix as convert_omnipbr_to_remix
+
+def parse_material(material_prim):
+    """Standardized parse function - alias for parse_omnipbr_material"""
+    return parse_omnipbr_material(material_prim)
+
+def parse_omnipbr_material(material_prim):
+    """Parse OmniPBR material from a material prim"""
+    try:
+        from pxr import UsdShade
+        import os
+        
+        material = UsdShade.Material(material_prim)
+        
+        # Try standard surface output first
+        surface_output = material.GetSurfaceOutput()
+        shader_prim = None
+        
+        if surface_output:
+            connected_source = surface_output.GetConnectedSource()
+            if connected_source and len(connected_source) > 0:
+                shader_prim = connected_source[0].GetPrim()
+        
+        # If no standard surface, try MDL surface output
+        if not shader_prim:
+            mdl_surface = material.GetOutput('mdl:surface')
+            if mdl_surface:
+                connected_source = mdl_surface.GetConnectedSource()
+                if connected_source and len(connected_source) > 0:
+                    shader_prim = connected_source[0].GetPrim()
+        
+        # If still no shader, look for Shader child prim directly
+        if not shader_prim:
+            for child in material_prim.GetChildren():
+                if child.GetName() == 'Shader':
+                    shader_prim = child
+                    break
+        
+        if not shader_prim:
+            return None
+        
+        # Check for MDL source asset
+        mdl_attr = shader_prim.GetAttribute('info:mdl:sourceAsset')
+        if not mdl_attr or not mdl_attr.HasValue():
+            return None
+        
+        mdl_path = str(mdl_attr.Get()).strip('@')
+        if not mdl_path or not mdl_path.endswith('.mdl'):
+            return None
+        
+        # Resolve MDL path relative to USD file
+        stage = material_prim.GetStage()
+        root_layer = stage.GetRootLayer()
+        usd_dir = os.path.dirname(root_layer.identifier)
+        mdl_full_path = os.path.join(usd_dir, mdl_path)
+        
+        if not os.path.exists(mdl_full_path):
+            print(f"WARNING MDL file not found: {mdl_full_path}")
+            return None
+        
+        # Parse the MDL file to get OmniPBR parameters
+        omnipbr_params = parse_omnipbr_mdl(mdl_full_path)
+        
+        # CRITICAL: Extract texture paths and mark them with _is_texture flag
+        # This matches the PrincipledBSDF approach for texture conversion
+        if omnipbr_params:
+            mdl_dir = os.path.dirname(mdl_full_path)
+            for param_name, param_value in list(omnipbr_params.items()):
+                if isinstance(param_value, str) and 'texture_2d(' in param_value:
+                    # Extract texture path from texture_2d("path", gamma) format
+                    import re
+                    match = re.search(r'texture_2d\("([^"]+)"', param_value)
+                    if match:
+                        texture_path = match.group(1)
+                        # Skip empty texture_2d() entries
+                        if not texture_path or texture_path == '':
+                            continue
+                        
+                        # Resolve relative paths from MDL directory
+                        if texture_path.startswith('./'):
+                            resolved_path = os.path.join(mdl_dir, texture_path[2:])
+                            resolved_path = os.path.normpath(resolved_path).replace('\\', '/')
+                            texture_path = resolved_path
+                        
+                        # Mark as texture for conversion system
+                        omnipbr_params[f"{param_name}_is_texture"] = True
+                        # Store the clean texture path (without texture_2d wrapper)
+                        omnipbr_params[param_name] = texture_path
+        
+        return omnipbr_params
+        
+    except Exception as e:
+        print(f"ERROR Failed to parse OmniPBR material: {e}")
+        return None
 
 def parse_omnipbr_mdl(mdl_file_path):
     """

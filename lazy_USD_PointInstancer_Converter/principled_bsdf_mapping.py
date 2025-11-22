@@ -1,236 +1,193 @@
 #!/usr/bin/env python3
 """
 Principled_BSDF to Remix Opacity Material Mapping
-Converts Blender-exported Principled_BSDF materials to Remix-compatible materials
+Aligned with OmniPBR converter features
 """
 
-# Mapping from Principled_BSDF parameters to Remix Opacity Material parameters
-PRINCIPLED_BSDF_TO_REMIX_MAPPING = {
-    # === DIFFUSE/ALBEDO PARAMETERS ===
-    'diffuseColor': 'diffuse_color_constant',  # Base color value
-    'diffuseColor.connect': 'diffuse_texture',  # Base color texture
-    'inputs:diffuseColor': 'diffuse_color_constant',  # USD format
-    'inputs:diffuseColor.connect': 'diffuse_texture',  # USD format
-    
-    # === METALLIC PARAMETERS ===
-    'metallic': 'metallic_constant',  # Metallic value
-    'metallic.connect': 'metallic_texture',  # Metallic texture
-    'inputs:metallic': 'metallic_constant',  # USD format
-    'inputs:metallic.connect': 'metallic_texture',  # USD format
-    
-    # === ROUGHNESS PARAMETERS ===
-    'roughness': 'reflection_roughness_constant',  # Roughness value
-    'roughness.connect': 'reflectionroughness_texture',  # Roughness texture
-    'inputs:roughness': 'reflection_roughness_constant',  # USD format
-    'inputs:roughness.connect': 'reflectionroughness_texture',  # USD format
-    
-    # === NORMAL MAP PARAMETERS ===
-    'normal.connect': 'normalmap_texture',  # Normal map texture
-    'inputs:normal.connect': 'normalmap_texture',  # USD format
-    
-    # === EMISSION PARAMETERS ===
-    'emissiveColor': 'emissive_color_constant',  # Emission color
-    'emissiveColor.connect': 'emissive_mask_texture',  # Emission texture
-    'inputs:emissiveColor': 'emissive_color_constant',  # USD format
-    'inputs:emissiveColor.connect': 'emissive_mask_texture',  # USD format
-    
-    # === OPACITY PARAMETERS ===
-    'opacity': 'opacity_constant',  # Opacity value
-    'opacity.connect': 'opacity_texture',  # Opacity texture
-    'inputs:opacity': 'opacity_constant',  # USD format
-    'inputs:opacity.connect': 'opacity_texture',  # USD format
-    
-    # === SPECULAR PARAMETERS ===
-    'specular': 'specular_constant',  # Specular value
-    'specular.connect': 'specular_texture',  # Specular texture
-    'inputs:specular': 'specular_constant',  # USD format
-    'inputs:specular.connect': 'specular_texture',  # USD format
-    
-    # === ANISOTROPY PARAMETERS ===
-    'anisotropy': 'anisotropy_constant',  # Anisotropy value
-    'anisotropy.connect': 'anisotropy_texture',  # Anisotropy texture
-    'inputs:anisotropy': 'anisotropy_constant',  # USD format
-    'inputs:anisotropy.connect': 'anisotropy_texture',  # USD format
-    
-    # === CLEARCOAT PARAMETERS ===
-    'clearcoat': 'clearcoat_constant',  # Clearcoat value
-    'clearcoat.connect': 'clearcoat_texture',  # Clearcoat texture
-    'clearcoatRoughness': 'clearcoat_roughness_constant',  # Clearcoat roughness
-    'clearcoatRoughness.connect': 'clearcoat_roughness_texture',  # Clearcoat roughness texture
-    'inputs:clearcoat': 'clearcoat_constant',  # USD format
-    'inputs:clearcoat.connect': 'clearcoat_texture',  # USD format
-    'inputs:clearcoatRoughness': 'clearcoat_roughness_constant',  # USD format
-    'inputs:clearcoatRoughness.connect': 'clearcoat_roughness_texture',  # USD format
-    
-    # === IOR PARAMETERS ===
-    'ior': 'ior_constant',  # Index of refraction
-    'inputs:ior': 'ior_constant',  # USD format
-    
-    # === SUBSURFACE PARAMETERS ===
-    'subsurface': 'subsurface_constant',  # Subsurface value
-    'subsurface.connect': 'subsurface_texture',  # Subsurface texture
-    'subsurfaceColor': 'subsurface_color_constant',  # Subsurface color
-    'subsurfaceColor.connect': 'subsurface_color_texture',  # Subsurface color texture
-    'inputs:subsurface': 'subsurface_constant',  # USD format
-    'inputs:subsurface.connect': 'subsurface_texture',  # USD format
-    'inputs:subsurfaceColor': 'subsurface_color_constant',  # USD format
-    'inputs:subsurfaceColor.connect': 'subsurface_color_texture',  # USD format
-}
+from aperture_pbr_parameters import (
+    get_texture_gamma_mode,
+    matches_default_value
+)
+from principled_bsdf_parameters import PRINCIPLED_BSDF_TO_REMIX_MAPPING
 
-# Mapping from UsdPreviewSurface parameters to Remix Opacity Material parameters
-# Only include parameters that actually exist in AperturePBR_Opacity.mdl
-USD_PREVIEW_SURFACE_TO_REMIX_MAPPING = {
-    # === DIFFUSE/ALBEDO PARAMETERS ===
-    'inputs:diffuseColor.connect': 'diffuse_texture',  # Base color texture
-    'inputs:diffuseColor': 'diffuse_color_constant',  # Base color value
-    
-    # === METALLIC PARAMETERS ===
-    'inputs:metallic': 'metallic_constant',  # Metallic value
-    'inputs:metallic.connect': 'metallic_texture',  # Metallic texture
-    
-    # === ROUGHNESS PARAMETERS ===
-    'inputs:roughness': 'reflection_roughness_constant',  # Roughness value
-    'inputs:roughness.connect': 'reflectionroughness_texture',  # Roughness texture
-    
-    # === NORMAL MAP PARAMETERS ===
-    'inputs:normal.connect': 'normalmap_texture',  # Normal map texture
-    
-    # === EMISSION PARAMETERS ===
-    'inputs:emissiveColor': 'emissive_color_constant',  # Emission color
-    'inputs:emissiveColor.connect': 'emissive_mask_texture',  # Emission texture
-    
-    # === OPACITY PARAMETERS ===
-    'inputs:opacity': 'opacity_constant',  # Opacity value
-    'inputs:opacity.connect': 'opacity_texture',  # Opacity texture
-    
-    # === ANISOTROPY PARAMETERS ===
-    'inputs:anisotropy': 'anisotropy_constant',  # Anisotropy value
-    'inputs:anisotropy.connect': 'anisotropy_texture',  # Anisotropy texture
-}
-
-# Default values for Remix Opacity Material parameters
-# Only include parameters that actually exist in AperturePBR_Opacity.mdl
-REMIX_DEFAULT_VALUES = {
-    'opacity_constant': 1.0,
-    'enable_emission': False,
-    'emissive_color_constant': 'color(0.0, 0.0, 0.0)',
-    'emissive_intensity': 1.0,
-    'enable_thin_film': False,
-    'thin_film_thickness_constant': 200.0,
-    'anisotropy_constant': 0.0,
-    'use_legacy_alpha_state': True,
-    'blend_enabled': False,
-    'filter_mode': 'Linear',
-    'wrap_mode_u': 'tex::wrap_repeat',
-    'wrap_mode_v': 'tex::wrap_repeat',
-    'encoding': 'AperturePBR_Normal::octahedral',
-    'sprite_sheet_fps': 0,
-    'sprite_sheet_cols': 1,
-    'sprite_sheet_rows': 1,
-    'preload_textures': False,
-    'ignore_material': False,
-    'alpha_test_type': 'Always',
-    'alpha_test_reference_value': 0.0,
-    'displace_in': 0.05,
-    'displace_out': 0.0,
-    'diffuse_color_constant': 'color(0.8, 0.8, 0.8)',
-    'reflection_roughness_constant': 0.5,
-    'metallic_constant': 0.0,
-    'specular_constant': 0.04,  # Default specular value
-    'ior_constant': 1.5,  # Default IOR for most materials
-    'clearcoat_constant': 0.0,  # Default no clearcoat
-    'clearcoat_roughness_constant': 0.1,  # Default clearcoat roughness
-    'subsurface_constant': 0.0,  # Default no subsurface
-    'subsurface_color_constant': 'color(1.0, 1.0, 1.0)',  # Default white subsurface
-}
-
-# Texture gamma modes for Remix Opacity Material
-TEXTURE_GAMMA_MODES = {
-    'diffuse_texture': 'tex::gamma_srgb',
-    'reflectionroughness_texture': 'tex::gamma_linear',
-    'metallic_texture': 'tex::gamma_linear',
-    'normalmap_texture': 'tex::gamma_linear',
-    'emissive_mask_texture': 'tex::gamma_srgb',
-    'opacity_texture': 'tex::gamma_srgb',
-    'specular_texture': 'tex::gamma_linear',
-    'anisotropy_texture': 'tex::gamma_linear',
-    'clearcoat_texture': 'tex::gamma_linear',
-    'clearcoat_roughness_texture': 'tex::gamma_linear',
-    'subsurface_texture': 'tex::gamma_linear',
-    'subsurface_color_texture': 'tex::gamma_srgb',
-    'ior_texture': 'tex::gamma_linear',
-}
-
-# Parameter transformations for specific types
-PARAMETER_TRANSFORMATIONS = {
-    'diffuseColor': lambda value: _fix_color_parameter(value),
-    'diffuseColor.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_srgb'),
-    'metallic': lambda value: _fix_float_parameter(value),
-    'metallic.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_linear'),
-    'roughness': lambda value: _fix_float_parameter(value),
-    'roughness.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_linear'),
-    'normal.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_linear'),
-    'emissiveColor': lambda value: _fix_color_parameter(value),
-    'emissiveColor.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_srgb'),
-    'opacity': lambda value: _fix_float_parameter(value),
-    'opacity.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_srgb'),
-    'specular': lambda value: _fix_float_parameter(value),
-    'specular.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_linear'),
-    'clearcoat': lambda value: _fix_float_parameter(value),
-    'clearcoat.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_linear'),
-    'clearcoatRoughness': lambda value: _fix_float_parameter(value),
-    'clearcoatRoughness.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_linear'),
-    'ior': lambda value: _fix_float_parameter(value),
-    'subsurface': lambda value: _fix_float_parameter(value),
-    'subsurface.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_linear'),
-    'subsurfaceColor': lambda value: _fix_color_parameter(value),
-    'subsurfaceColor.connect': lambda value: _fix_texture_parameter(value, 'tex::gamma_srgb'),
-}
-
-def _fix_texture_parameter(value, gamma_mode):
-    """Fix texture parameter format for Remix materials"""
-    if not value or value == '""':
-        return f'texture_2d("", {gamma_mode})'
-    
-    # Handle USD connection paths - extract the actual texture file
-    if value.startswith('</') and value.endswith('.outputs:rgb>'):
-        # This is a USD connection path, we need to find the actual texture file
-        # For now, return empty texture - the actual texture path extraction would need
-        # to parse the USD file to find the texture shader and its file path
-        return f'texture_2d("", {gamma_mode})'
-    
-    # Extract texture path from USD asset reference
-    if value.startswith('@') and value.endswith('@'):
-        texture_path = value[1:-1]  # Remove @ symbols
-        # For Principled_BSDF, textures are in ./textures/ relative to the input file
-        # No need to change the path - keep it as ./textures/
-        # Convert relative path to texture_2d format
-        return f'texture_2d("{texture_path}", {gamma_mode})'
-    
-    # Handle direct texture paths
-    if isinstance(value, str):
-        # For Principled_BSDF, textures are in ./textures/ relative to the input file
-        # No need to change the path - keep it as ./textures/
-        pass
-    
-    return f'texture_2d("{value}", {gamma_mode})'
-
-def _fix_color_parameter(value):
-    """Fix color parameter format for Remix materials"""
-    if isinstance(value, str):
-        # Handle USD color format (r, g, b) -> color(r, g, b)
-        if value.startswith('(') and value.endswith(')'):
-            return f'color{value}'
-        return value
-    return value
-
-def _fix_float_parameter(value):
-    """Fix float parameter format for Remix materials"""
-    if isinstance(value, (int, float)):
-        return f'{value}f'
-    return value
+# Global cache for alpha channel detection to avoid redundant checks
+_texture_alpha_cache = {}
 
 
+
+def _apply_specular_to_roughness_fallback(remix_params, original_params):
+    """
+    Apply specular-to-roughness fallback when no roughness texture exists.
+    Marks material for texture inversion: roughness = 1 - specular
+    """
+    has_roughness_texture = 'reflectionroughness_texture' in remix_params
+    has_specular_texture = '_specular_texture' in remix_params
+    
+    if not has_roughness_texture and has_specular_texture:
+        # Mark for inversion and use specular texture as roughness source
+        remix_params['_invert_for_roughness'] = True
+        remix_params['_specular_source'] = remix_params['_specular_texture']
+        # Add to original params so it gets processed
+        original_params.add('reflectionroughness_texture')
+    
+    # Clean up temporary specular tracking
+    if '_specular_texture' in remix_params:
+        del remix_params['_specular_texture']
+    if '_specular_constant' in remix_params:
+        del remix_params['_specular_constant']
+    
+    return remix_params
+
+def _check_texture_has_alpha(texture_path, source_textures_dir):
+    """
+    Check if a texture file has an alpha channel (cached).
+    
+    Args:
+        texture_path: Texture path from material (e.g., './textures/file.png')
+        source_textures_dir: Directory containing source textures
+    
+    Returns:
+        bool: True if texture has alpha channel, False otherwise
+    """
+    global _texture_alpha_cache
+    
+    # Check cache first
+    if texture_path in _texture_alpha_cache:
+        return _texture_alpha_cache[texture_path]
+    
+    try:
+        from PIL import Image
+        import os
+        
+        # Extract filename from path
+        filename = os.path.basename(texture_path.replace('./textures/', ''))
+        base_name = os.path.splitext(filename)[0]
+        
+        # Try common image extensions
+        for ext in ['.png', '.tga', '.bmp']:
+            source_file = os.path.join(source_textures_dir, base_name + ext)
+            if os.path.exists(source_file):
+                img = Image.open(source_file)
+                has_alpha = img.mode in ('RGBA', 'LA', 'PA')
+                _texture_alpha_cache[texture_path] = has_alpha
+                return has_alpha
+        
+        # File not found or no alpha
+        _texture_alpha_cache[texture_path] = False
+        return False
+        
+    except Exception:
+        _texture_alpha_cache[texture_path] = False
+        return False
+
+def _detect_and_combine_opacity_texture(remix_params, original_params, source_textures_dir=None, auto_blend_alpha=True):
+    """
+    Detect if material has both diffuse and opacity textures that need combining.
+    Also check if diffuse texture has alpha channel when no separate opacity texture exists.
+    RTX Remix doesn't support separate opacity_texture - must be in diffuse alpha channel.
+    
+    Args:
+        remix_params (dict): Remix parameters dictionary
+        original_params (set): Set of original parameter names
+        source_textures_dir (str): Directory containing source textures for alpha detection
+        auto_blend_alpha (bool): Whether to auto-enable blend mode for alpha textures
+    
+    Returns:
+        dict: Updated remix parameters with _combine_opacity_with_diffuse flag
+    """
+    has_diffuse_texture = 'diffuse_texture' in remix_params
+    has_opacity_texture = 'opacity_texture' in remix_params
+    
+    # If we have both diffuse and opacity textures, mark for combination
+    if has_diffuse_texture and has_opacity_texture:
+        remix_params['_combine_opacity_with_diffuse'] = True
+        # Use the ORIGINAL opacity texture path (stored before _fix_texture_parameter)
+        if '_opacity_texture_original' in remix_params:
+            remix_params['_opacity_texture_path'] = remix_params['_opacity_texture_original']
+            del remix_params['_opacity_texture_original']
+        else:
+            remix_params['_opacity_texture_path'] = remix_params['opacity_texture']
+        remix_params['blend_enabled'] = True
+        original_params.add('blend_enabled')
+        # Remove opacity_texture from final params (will be combined into diffuse alpha)
+        del remix_params['opacity_texture']
+        original_params.discard('opacity_texture')
+    
+    # Check if diffuse texture has alpha channel (only if no separate opacity texture and auto_blend enabled)
+    elif has_diffuse_texture and not has_opacity_texture and auto_blend_alpha and source_textures_dir:
+        # Use ORIGINAL path (before DDS conversion) for alpha detection
+        diffuse_path = remix_params.get('_diffuse_texture_original', remix_params.get('diffuse_texture', ''))
+        if diffuse_path and _check_texture_has_alpha(diffuse_path, source_textures_dir):
+            # Diffuse has alpha channel - disable legacy alpha state and enable blend
+            remix_params['use_legacy_alpha_state'] = False
+            remix_params['blend_enabled'] = True
+            original_params.add('use_legacy_alpha_state')
+            original_params.add('blend_enabled')
+        # Clean up temporary original path
+        if '_diffuse_texture_original' in remix_params:
+            del remix_params['_diffuse_texture_original']
+    
+    return remix_params
+
+
+def _has_pbr_suffix(filename):
+    """Check if filename already has a PBR suffix"""
+    lower = filename.lower()
+    pbr_suffixes = ['_diffuse', '_albedo', '_basecolor', '_color', 
+                    '_normal', '_norm', '_bump', '_height',
+                    '_roughness', '_rough', '_gloss', '_glossiness',
+                    '_metallic', '_metal', '_metalness',
+                    '_ao', '_occlusion', '_ambient',
+                    '_emissive', '_emission', '_glow',
+                    '_opacity', '_alpha', '_transparency']
+    return any(lower.endswith(suffix) for suffix in pbr_suffixes)
+
+def _fix_texture_parameter(value, texture_param_name):
+    """
+    Fix texture parameter format for Remix materials.
+    Only adds PBR suffix if texture doesn't already have one.
+    
+    Args:
+        value: The texture path value
+        texture_param_name: The name of the texture parameter
+    
+    Returns:
+        str: Properly formatted texture_2d() string
+    """
+    import os
+    
+    gamma_mode = get_texture_gamma_mode(texture_param_name)
+    tex_gamma = 'tex::gamma_srgb' if gamma_mode == 'srgb' else 'tex::gamma_linear'
+    
+    if not value or value == '""' or (value.startswith('</') and value.endswith('.outputs:rgb>')):
+        return f'texture_2d("", {tex_gamma})'
+    
+    texture_path = value.strip('@')
+    
+    if texture_path and isinstance(texture_path, str):
+        slot_type = texture_param_name.replace('_texture', '').replace('map', '')
+        base_name = os.path.splitext(os.path.basename(texture_path))[0]
+        
+        # Check if texture already has a PBR suffix
+        if _has_pbr_suffix(base_name):
+            # Already has suffix, don't add another
+            unique_name = f"{base_name}.dds"
+        elif slot_type == 'diffuse':
+            # Diffuse without suffix gets _albedo
+            unique_name = f"{base_name}_albedo.dds"
+        else:
+            # Add appropriate suffix
+            suffix = 'roughness' if slot_type == 'reflectionroughness' else slot_type
+            unique_name = f"{base_name}_{suffix}.dds"
+        
+        return f'texture_2d("./textures/{unique_name}", {tex_gamma})'
+    
+    return f'texture_2d("{value}", {tex_gamma})'
+
+
+def convert_to_remix(principled_params):
+    """Standardized conversion function - converts Principled_BSDF parameters to Remix parameters"""
+    return convert_principled_bsdf_to_remix(principled_params)
 
 def convert_principled_bsdf_to_remix(principled_params):
     """
@@ -241,249 +198,370 @@ def convert_principled_bsdf_to_remix(principled_params):
         principled_params (dict): Dictionary of Principled_BSDF or UsdPreviewSurface parameters
         
     Returns:
-        dict: Converted Remix parameters with all compatible values
+        dict: Converted Remix parameters with _original_params tracking
     """
     remix_params = {}
+    original_params = set()
     
-    # Start with essential default values
-    essential_defaults = {
-        'opacity_constant': 1.0,
-        'use_legacy_alpha_state': True,
-        'blend_enabled': False,
-        'diffuse_color_constant': 'color(0.8, 0.8, 0.8)',  # Default gray
-        'reflection_roughness_constant': 0.5,  # Default medium roughness
-        'metallic_constant': 0.0,  # Default non-metallic
-    }
-    remix_params.update(essential_defaults)
+    # Don't start with defaults - only add parameters that exist in source
     
-    # Check if emission is enabled
-    emission_enabled = False
+    # CRITICAL: First pass - check if emission exists in original material
+    has_emission_params = False
     emissive_color = None
     emissive_texture = None
     
-    # First pass: check for emission parameters
     for principled_param, value in principled_params.items():
         if principled_param.endswith('_is_texture'):
             continue
             
-        # Check for emission color
+        # Check for emission color parameter existence
         if principled_param in ['inputs:emissiveColor', 'emissiveColor']:
-            if value and value != (0, 0, 0) and value != 'color(0, 0, 0)' and str(value) != '(0, 0, 0)':
-                emission_enabled = True
-                emissive_color = value
+            has_emission_params = True
+            emissive_color = value
                 
-        # Check for emission texture
+        # Check for emission texture parameter existence
         is_texture = principled_params.get(f"{principled_param}_is_texture", False)
         if is_texture and principled_param in ['emissiveColor', 'inputs:emissiveColor']:
-            emission_enabled = True
+            has_emission_params = True
             emissive_texture = value
         elif principled_param.endswith('.connect') and 'emissiveColor' in principled_param:
-            emission_enabled = True
+            has_emission_params = True
             emissive_texture = value
     
-    # Set emission parameters only if emission is enabled and has content
-    if emission_enabled:
-        remix_params['enable_emission'] = True
-        remix_params['emissive_intensity'] = 1.0
-        if emissive_color:
-            if isinstance(emissive_color, (tuple, list)) and len(emissive_color) >= 3:
-                remix_params['emissive_color_constant'] = f"color({emissive_color[0]}, {emissive_color[1]}, {emissive_color[2]})"
-            elif isinstance(emissive_color, str) and not emissive_color.startswith('color('):
-                remix_params['emissive_color_constant'] = f"color({emissive_color})"
-            else:
-                remix_params['emissive_color_constant'] = str(emissive_color)
-        if emissive_texture:
-            remix_params['emissive_mask_texture'] = emissive_texture
-    else:
-        # Explicitly disable emission if no emissive content found
-        remix_params['enable_emission'] = False
+    # Check for texture bending fallbacks BEFORE processing parameters
+    has_roughness_texture = principled_params.get('inputs:roughness_is_texture', False)
+    has_specular_texture = principled_params.get('inputs:specular_is_texture', False)
+    has_diffuse_texture = principled_params.get('inputs:diffuseColor_is_texture', False)
     
-    # Second pass: copy ALL texture values and constant values
+    roughness_path = principled_params.get('inputs:roughness')
+    diffuse_path = principled_params.get('inputs:diffuseColor')
+    specular_path = principled_params.get('inputs:specular')
+    
+    # Helper to normalize paths for comparison
+    def normalize_path(path):
+        if not path or not isinstance(path, str):
+            return None
+        import os
+        clean = path.strip('@').replace('./textures/', '').replace('\\', '/')
+        return os.path.basename(clean).lower()
+    
+    roughness_file = normalize_path(roughness_path)
+    diffuse_file = normalize_path(diffuse_path)
+    specular_file = normalize_path(specular_path)
+    
+    # Check if roughness texture is same as diffuse (Blender blending trick)
+    if has_roughness_texture and has_diffuse_texture and roughness_file and diffuse_file and roughness_file == diffuse_file:
+        # Roughness uses same texture as diffuse - need grayscale conversion
+        import os
+        clean_path = diffuse_path.strip('@').replace('./textures/', '')
+        base_name = os.path.splitext(os.path.basename(clean_path))[0]
+        roughness_texture = f"./textures/{base_name}_roughness.dds"
+        
+        remix_params['_use_diffuse_for_roughness'] = True
+        remix_params['_diffuse_source'] = diffuse_path  # Store ORIGINAL path before _fix_texture_parameter
+        remix_params['reflectionroughness_texture'] = roughness_texture
+        original_params.add('reflectionroughness_texture')
+    elif not has_roughness_texture and has_specular_texture:
+        # No roughness texture - check if specular is same as diffuse
+        if specular_path and diffuse_file and specular_file == diffuse_file:
+            # Specular uses same texture as diffuse - use diffuse source with inversion
+            import os
+            clean_path = diffuse_path.strip('@').replace('./textures/', '')
+            base_name = os.path.splitext(os.path.basename(clean_path))[0]
+            roughness_texture = f"./textures/{base_name}_roughness.dds"
+            
+            remix_params['_invert_for_roughness'] = True
+            remix_params['_diffuse_source'] = diffuse_path  # Use diffuse as source, not specular
+            remix_params['reflectionroughness_texture'] = roughness_texture
+            original_params.add('reflectionroughness_texture')
+        elif specular_path:
+            # Specular has its own texture - use specular source with inversion
+            import os
+            clean_path = specular_path.strip('@').replace('./textures/', '')
+            base_name = os.path.splitext(os.path.basename(clean_path))[0]
+            roughness_texture = f"./textures/{base_name}_roughness.dds"
+            
+            remix_params['_invert_for_roughness'] = True
+            remix_params['_specular_source'] = specular_path  # Store ORIGINAL path before _fix_texture_parameter
+            remix_params['reflectionroughness_texture'] = roughness_texture
+            original_params.add('reflectionroughness_texture')
+    
+    # CRITICAL: Check for opacity texture BEFORE processing other parameters
+    # If opacity is a texture (alpha channel from diffuse), enable alpha blending
+    # Only if auto_blend_alpha is enabled (default True)
+    auto_blend_alpha = principled_params.get('_auto_blend_alpha', True)
+    if principled_params.get('inputs:opacity_is_texture', False):
+        if auto_blend_alpha:
+            remix_params['use_legacy_alpha_state'] = True
+            remix_params['blend_enabled'] = True
+            original_params.add('use_legacy_alpha_state')
+            original_params.add('blend_enabled')
+    
+    # Second pass: copy ALL texture values and constant values (skip emission if not in original)
     for principled_param, value in principled_params.items():
         # Skip texture markers
         if principled_param.endswith('_is_texture'):
+            continue
+        
+        # Skip emission parameters if no emission in original
+        if not has_emission_params and 'emissive' in principled_param.lower():
+            continue
+        
+        # Skip specular if using it for roughness fallback
+        if principled_param == 'inputs:specular' and remix_params.get('_invert_for_roughness'):
+            continue
+        
+        # Skip opacity CONSTANT - we don't use opacity_constant in Remix
+        # But DO process opacity TEXTURE connections (will be combined with diffuse alpha)
+        if principled_param in ['inputs:opacity', 'opacity'] and not is_texture:
             continue
             
         # Check if this is a texture parameter
         is_texture = principled_params.get(f"{principled_param}_is_texture", False)
         
         if is_texture:
-            # This is a resolved texture parameter - copy ALL texture types
+            # This is a resolved texture parameter - apply _fix_texture_parameter for slot suffixes
             if principled_param in ['diffuseColor', 'inputs:diffuseColor']:
-                remix_params['diffuse_texture'] = value
+                # Store ORIGINAL path for alpha detection (before DDS conversion)
+                remix_params['_diffuse_texture_original'] = value
+                remix_params['_diffuse_texture_source'] = value
+                remix_params['diffuse_texture'] = _fix_texture_parameter(value, 'diffuse_texture')
+                original_params.add('diffuse_texture')
             elif principled_param in ['metallic', 'inputs:metallic']:
-                remix_params['metallic_texture'] = value
+                remix_params['_metallic_texture_source'] = value
+                remix_params['metallic_texture'] = _fix_texture_parameter(value, 'metallic_texture')
+                original_params.add('metallic_texture')
             elif principled_param in ['roughness', 'inputs:roughness']:
-                remix_params['reflectionroughness_texture'] = value
-            elif principled_param in ['normal', 'inputs:normal']:
-                remix_params['normalmap_texture'] = value
-            elif principled_param in ['opacity', 'inputs:opacity']:
-                remix_params['opacity_texture'] = value
+                remix_params['_reflectionroughness_texture_source'] = value
+                remix_params['reflectionroughness_texture'] = _fix_texture_parameter(value, 'reflectionroughness_texture')
+                original_params.add('reflectionroughness_texture')
             elif principled_param in ['anisotropy', 'inputs:anisotropy']:
-                remix_params['anisotropy_texture'] = value
-            elif principled_param in ['specular', 'inputs:specular']:
-                remix_params['specular_texture'] = value
-            elif principled_param in ['clearcoat', 'inputs:clearcoat']:
-                remix_params['clearcoat_texture'] = value
-            elif principled_param in ['clearcoatRoughness', 'inputs:clearcoatRoughness']:
-                remix_params['clearcoat_roughness_texture'] = value
-            elif principled_param in ['subsurface', 'inputs:subsurface']:
-                remix_params['subsurface_texture'] = value
-            elif principled_param in ['subsurfaceColor', 'inputs:subsurfaceColor']:
-                remix_params['subsurface_color_texture'] = value
-            elif principled_param in ['ior', 'inputs:ior']:
-                remix_params['ior_texture'] = value
-            # Note: emission texture is already handled above
+                remix_params['_anisotropy_texture_source'] = value
+                remix_params['anisotropy_texture'] = _fix_texture_parameter(value, 'anisotropy_texture')
+                original_params.add('anisotropy_texture')
+            elif principled_param in ['normal', 'inputs:normal']:
+                remix_params['_normalmap_texture_source'] = value
+                remix_params['normalmap_texture'] = _fix_texture_parameter(value, 'normalmap_texture')
+                original_params.add('normalmap_texture')
+            elif principled_param in ['opacity', 'inputs:opacity']:
+                # Store ORIGINAL path for opacity combination (before _fix_texture_parameter)
+                remix_params['_opacity_texture_original'] = value
+                remix_params['_opacity_texture_source'] = value
+                remix_params['opacity_texture'] = _fix_texture_parameter(value, 'opacity_texture')
+                original_params.add('opacity_texture')
             
         elif principled_param.endswith('.connect'):
-            # Handle resolved texture connections
+            # Handle resolved texture connections - apply _fix_texture_parameter for slot suffixes
             base_param = principled_param.replace('inputs:', '').replace('.connect', '')
             if base_param in ['diffuseColor']:
-                remix_params['diffuse_texture'] = value
+                # Store ORIGINAL path for alpha detection (before DDS conversion)
+                remix_params['_diffuse_texture_original'] = value
+                remix_params['_diffuse_texture_source'] = value
+                remix_params['diffuse_texture'] = _fix_texture_parameter(value, 'diffuse_texture')
+                original_params.add('diffuse_texture')
             elif base_param in ['metallic']:
-                remix_params['metallic_texture'] = value
+                remix_params['_metallic_texture_source'] = value
+                remix_params['metallic_texture'] = _fix_texture_parameter(value, 'metallic_texture')
+                original_params.add('metallic_texture')
             elif base_param in ['roughness']:
-                remix_params['reflectionroughness_texture'] = value
-            elif base_param in ['normal']:
-                remix_params['normalmap_texture'] = value
-            elif base_param in ['opacity']:
-                remix_params['opacity_texture'] = value
-            elif base_param in ['anisotropy']:
-                remix_params['anisotropy_texture'] = value
+                remix_params['_reflectionroughness_texture_source'] = value
+                remix_params['reflectionroughness_texture'] = _fix_texture_parameter(value, 'reflectionroughness_texture')
+                original_params.add('reflectionroughness_texture')
             elif base_param in ['specular']:
-                remix_params['specular_texture'] = value
-            elif base_param in ['clearcoat']:
-                remix_params['clearcoat_texture'] = value
-            elif base_param in ['clearcoatRoughness']:
-                remix_params['clearcoat_roughness_texture'] = value
-            elif base_param in ['subsurface']:
-                remix_params['subsurface_texture'] = value
-            elif base_param in ['subsurfaceColor']:
-                remix_params['subsurface_color_texture'] = value
-            elif base_param in ['ior']:
-                remix_params['ior_texture'] = value
-            # Note: emission texture is already handled above
+                # Store specular texture for potential roughness fallback (don't fix yet, will be fixed when used)
+                remix_params['_specular_texture'] = value
+            elif base_param in ['anisotropy']:
+                remix_params['_anisotropy_texture_source'] = value
+                remix_params['anisotropy_texture'] = _fix_texture_parameter(value, 'anisotropy_texture')
+                original_params.add('anisotropy_texture')
+            elif base_param in ['normal']:
+                remix_params['_normalmap_texture_source'] = value
+                remix_params['normalmap_texture'] = _fix_texture_parameter(value, 'normalmap_texture')
+                original_params.add('normalmap_texture')
+            elif base_param in ['opacity']:
+                # Opacity connection detected - add opacity texture for combination
+                remix_params['_opacity_texture_source'] = value
+                remix_params['opacity_texture'] = _fix_texture_parameter(value, 'opacity_texture')
+                original_params.add('opacity_texture')
+                # Only enable blend if auto_blend_alpha is True
+                if principled_params.get('_auto_blend_alpha', True):
+                    remix_params['use_legacy_alpha_state'] = True
+                    remix_params['blend_enabled'] = True
+                    original_params.add('use_legacy_alpha_state')
+                    original_params.add('blend_enabled')
             
         else:
             # This is a constant parameter - copy ALL compatible constants
-            if value is not None and not (principled_param in ['emissiveColor', 'inputs:emissiveColor'] and not emission_enabled):
+            if value is not None:
                 
                 # === DIFFUSE/ALBEDO COLOR ===
                 if principled_param in ['diffuseColor', 'inputs:diffuseColor']:
-                    if isinstance(value, (tuple, list)) and len(value) >= 3:
-                        remix_params['diffuse_color_constant'] = f"color({value[0]}, {value[1]}, {value[2]})"
-                    elif isinstance(value, str) and value.startswith('(') and value.endswith(')'):
-                        # Handle string tuples like "(0.8, 0.8, 0.8)"
-                        remix_params['diffuse_color_constant'] = f"color{value}"
-                    elif isinstance(value, str) and not value.startswith('color('):
-                        remix_params['diffuse_color_constant'] = f"color({value})"
-                    else:
-                        remix_params['diffuse_color_constant'] = str(value)
+                    # Only store color constant if there's NO texture (avoid assigning texture path to constant)
+                    has_diffuse_texture = 'diffuse_texture' in remix_params or any(k.endswith('diffuseColor.connect') for k in principled_params.keys())
+                    if not has_diffuse_texture:
+                        if isinstance(value, (tuple, list)) and len(value) >= 3:
+                            # Store as tuple for proper USD conversion
+                            remix_params['diffuse_color_constant'] = (float(value[0]), float(value[1]), float(value[2]))
+                        elif isinstance(value, str) and value.startswith('(') and value.endswith(')'):
+                            # Parse string tuple like "(0.8, 0.8, 0.8)"
+                            try:
+                                values = value.strip('()').split(',')
+                                remix_params['diffuse_color_constant'] = (float(values[0]), float(values[1]), float(values[2]))
+                            except:
+                                remix_params['diffuse_color_constant'] = value
+                        else:
+                            # Skip if value looks like a texture path
+                            if not isinstance(value, str) or not ('.png' in value or '.jpg' in value or '.dds' in value or '.tga' in value):
+                                remix_params['diffuse_color_constant'] = value
+                        if 'diffuse_color_constant' in remix_params:
+                            original_params.add('diffuse_color_constant')
                 
                 # === METALLIC VALUE ===
                 elif principled_param in ['metallic', 'inputs:metallic']:
                     if isinstance(value, (int, float)):
-                        remix_params['metallic_constant'] = float(value)
+                        metal_val = float(value)
+                        if not matches_default_value('metallic_constant', metal_val):
+                            remix_params['metallic_constant'] = metal_val
+                            original_params.add('metallic_constant')
                     elif isinstance(value, str):
                         try:
-                            remix_params['metallic_constant'] = float(value)
+                            metal_val = float(value)
+                            if not matches_default_value('metallic_constant', metal_val):
+                                remix_params['metallic_constant'] = metal_val
+                                original_params.add('metallic_constant')
                         except ValueError:
                             pass
                 
                 # === ROUGHNESS VALUE ===
                 elif principled_param in ['roughness', 'inputs:roughness']:
-                    if isinstance(value, (int, float)):
-                        remix_params['reflection_roughness_constant'] = float(value)
-                    elif isinstance(value, str):
-                        try:
-                            remix_params['reflection_roughness_constant'] = float(value)
-                        except ValueError:
-                            pass
+                    # Skip roughness constant if using specular-to-roughness fallback
+                    if not remix_params.get('_invert_for_roughness'):
+                        if isinstance(value, (int, float)):
+                            rough_val = float(value)
+                            if not matches_default_value('reflection_roughness_constant', rough_val):
+                                remix_params['reflection_roughness_constant'] = rough_val
+                                original_params.add('reflection_roughness_constant')
+                        elif isinstance(value, str):
+                            try:
+                                rough_val = float(value)
+                                if not matches_default_value('reflection_roughness_constant', rough_val):
+                                    remix_params['reflection_roughness_constant'] = rough_val
+                                    original_params.add('reflection_roughness_constant')
+                            except ValueError:
+                                pass
                 
-                # === OPACITY VALUE ===
-                elif principled_param in ['opacity', 'inputs:opacity']:
-                    if isinstance(value, (int, float)):
-                        remix_params['opacity_constant'] = float(value)
-                    elif isinstance(value, str):
-                        try:
-                            remix_params['opacity_constant'] = float(value)
-                        except ValueError:
-                            pass
-                
-                # === SPECULAR VALUE ===
+                # === SPECULAR VALUE (for roughness inversion when roughness=1 and specular!=0) ===
                 elif principled_param in ['specular', 'inputs:specular']:
-                    if isinstance(value, (int, float)):
-                        remix_params['specular_constant'] = float(value)
-                    elif isinstance(value, str):
-                        try:
-                            remix_params['specular_constant'] = float(value)
-                        except ValueError:
-                            pass
+                    specular_val = float(value) if isinstance(value, (int, float)) else (float(value) if isinstance(value, str) else 0.0)
+                    # Check if roughness is 1.0 and specular is not 0 - need to invert
+                    roughness_val = principled_params.get('inputs:roughness', principled_params.get('roughness', 0.0))
+                    if isinstance(roughness_val, (int, float)) and roughness_val == 1.0 and specular_val != 0.0:
+                        # Invert: roughness = 1 - specular
+                        remix_params['reflection_roughness_constant'] = 1.0 - specular_val
+                        original_params.add('reflection_roughness_constant')
+                    # Store specular for potential texture fallback
+                    remix_params['_specular_constant'] = specular_val
                 
                 # === ANISOTROPY VALUE ===
                 elif principled_param in ['anisotropy', 'inputs:anisotropy']:
                     if isinstance(value, (int, float)):
-                        remix_params['anisotropy_constant'] = float(value)
+                        aniso_val = float(value)
+                        if not matches_default_value('anisotropy_constant', aniso_val):
+                            remix_params['anisotropy_constant'] = aniso_val
+                            original_params.add('anisotropy_constant')
                     elif isinstance(value, str):
                         try:
-                            remix_params['anisotropy_constant'] = float(value)
+                            aniso_val = float(value)
+                            if not matches_default_value('anisotropy_constant', aniso_val):
+                                remix_params['anisotropy_constant'] = aniso_val
+                                original_params.add('anisotropy_constant')
                         except ValueError:
                             pass
                 
-                # === IOR VALUE ===
-                elif principled_param in ['ior', 'inputs:ior']:
-                    if isinstance(value, (int, float)):
-                        remix_params['ior_constant'] = float(value)
-                    elif isinstance(value, str):
-                        try:
-                            remix_params['ior_constant'] = float(value)
-                        except ValueError:
-                            pass
-                
-                # === CLEARCOAT VALUES ===
-                elif principled_param in ['clearcoat', 'inputs:clearcoat']:
-                    if isinstance(value, (int, float)):
-                        remix_params['clearcoat_constant'] = float(value)
-                    elif isinstance(value, str):
-                        try:
-                            remix_params['clearcoat_constant'] = float(value)
-                        except ValueError:
-                            pass
-                
-                elif principled_param in ['clearcoatRoughness', 'inputs:clearcoatRoughness']:
-                    if isinstance(value, (int, float)):
-                        remix_params['clearcoat_roughness_constant'] = float(value)
-                    elif isinstance(value, str):
-                        try:
-                            remix_params['clearcoat_roughness_constant'] = float(value)
-                        except ValueError:
-                            pass
-                
-                # === SUBSURFACE VALUES ===
-                elif principled_param in ['subsurface', 'inputs:subsurface']:
-                    if isinstance(value, (int, float)):
-                        remix_params['subsurface_constant'] = float(value)
-                    elif isinstance(value, str):
-                        try:
-                            remix_params['subsurface_constant'] = float(value)
-                        except ValueError:
-                            pass
-                
-                elif principled_param in ['subsurfaceColor', 'inputs:subsurfaceColor']:
+                # === EMISSIVE COLOR ===
+                elif principled_param in ['emissiveColor', 'inputs:emissiveColor']:
                     if isinstance(value, (tuple, list)) and len(value) >= 3:
-                        remix_params['subsurface_color_constant'] = f"color({value[0]}, {value[1]}, {value[2]})"
+                        # Store as tuple for proper USD conversion
+                        remix_params['emissive_color_constant'] = (float(value[0]), float(value[1]), float(value[2]))
                     elif isinstance(value, str) and value.startswith('(') and value.endswith(')'):
-                        remix_params['subsurface_color_constant'] = f"color{value}"
-                    elif isinstance(value, str) and not value.startswith('color('):
-                        remix_params['subsurface_color_constant'] = f"color({value})"
+                        # Parse string tuple
+                        try:
+                            values = value.strip('()').split(',')
+                            remix_params['emissive_color_constant'] = (float(values[0]), float(values[1]), float(values[2]))
+                        except:
+                            remix_params['emissive_color_constant'] = value
                     else:
-                        remix_params['subsurface_color_constant'] = str(value)
+                        remix_params['emissive_color_constant'] = value
+                    original_params.add('emissive_color_constant')
+                
+                # Skip opacity_constant (not used in Remix, only opacity_texture for alpha)
+                
+                # NOTE: The following parameters are NOT processed because they don't exist in AperturePBR_Opacity.mdl:
+                # - inputs:specular -> specular_constant (no specular parameter exists)
+                # - inputs:ior -> ior_constant (no IOR parameter exists)
+                # - inputs:clearcoat -> clearcoat_constant (no clearcoat parameters exist)
+                # - inputs:clearcoatRoughness -> clearcoat_roughness_constant (no clearcoat parameters exist)
+                # - inputs:subsurface -> subsurface_constant (no subsurface_constant parameter exists)
+                # - inputs:subsurfaceColor -> subsurface_color_constant (no subsurface_color_constant parameter exists)
     
-    # Handle opacity for transparency - enable blending if opacity < 1.0
-    if 'opacity_texture' in remix_params or 'opacity_constant' in remix_params:
-        opacity_value = remix_params.get('opacity_constant', 1.0)
-        if isinstance(opacity_value, (int, float)) and opacity_value < 1.0:
-            remix_params['blend_enabled'] = True
+    # CRITICAL: Only add emission parameters if there's an emissive TEXTURE (not just color)
+    if has_emission_params and emissive_texture:
+        # Only enable emission if there's a texture
+        remix_params['enable_emission'] = True
+        original_params.add('enable_emission')
+        remix_params['emissive_intensity'] = 1.0
+        original_params.add('emissive_intensity')
+    else:
+        # Remove emissive_color_constant if no texture (don't pass color-only emission)
+        if 'emissive_color_constant' in remix_params:
+            del remix_params['emissive_color_constant']
+            original_params.discard('emissive_color_constant')
+    
+    # Remove opacity_constant if present (not used in Remix, only opacity_texture for alpha)
+    if 'opacity_constant' in remix_params:
+        del remix_params['opacity_constant']
+        original_params.discard('opacity_constant')
+    
+    # Apply specular-to-roughness fallback if needed
+    remix_params = _apply_specular_to_roughness_fallback(remix_params, original_params)
+    
+    # Detect and handle opacity texture combination
+    source_textures_dir = principled_params.get('_source_textures_dir')
+    auto_blend_alpha = principled_params.get('_auto_blend_alpha', True)
+    remix_params = _detect_and_combine_opacity_texture(remix_params, original_params, source_textures_dir, auto_blend_alpha)
+    
+    # Texture deduplication is now handled by _fix_texture_parameter with slot prefixes
+    # No need for manual split detection - each slot gets unique prefix automatically
+    
+    # Check if normal map texture is actually a bump/height map (needs bump-to-normal conversion)
+    normal_tex_source = remix_params.get('_normalmap_texture_source')
+    if normal_tex_source:
+        import os
+        normal_clean = normal_tex_source.strip('@').replace('./textures/', '')
+        filename_lower = os.path.splitext(normal_clean)[0].lower()
+        
+        # Detect bump textures by filename ending with bump/height/displacement
+        if filename_lower.endswith('_bump') or filename_lower.endswith('bump') or \
+           filename_lower.endswith('_height') or filename_lower.endswith('height') or \
+           filename_lower.endswith('_displacement') or filename_lower.endswith('displacement'):
+            # Mark this as a bump texture that needs normal generation
+            remix_params['_is_bump_texture'] = True
+            # Get base name without bump/height/displacement suffix
+            base_name = os.path.splitext(os.path.basename(normal_clean))[0]
+            for suffix in ['_bump', '_height', '_displacement']:
+                if base_name.lower().endswith(suffix):
+                    base_name = base_name[:-len(suffix)]
+                    break
+            # Update normalmap_texture to use _normal suffix (needs bump-to-normal conversion)
+            remix_params['_normalmap_texture_source'] = normal_tex_source
+            remix_params['normalmap_texture'] = f'texture_2d("./textures/{base_name}_normal.dds", tex::gamma_linear)'
+            # Height texture uses _height suffix (just DDS conversion, no processing)
+            remix_params['_height_texture_source'] = normal_tex_source
+            remix_params['height_texture'] = f'texture_2d("./textures/{base_name}_height.dds", tex::gamma_linear)'
+            original_params.add('height_texture')
+    
+    # Store original parameter names for filtering
+    remix_params['_original_params'] = original_params
     
     return remix_params
 
@@ -521,90 +599,13 @@ def _apply_special_transformations(remix_params, principled_params):
         if isinstance(opacity, (int, float)) and opacity < 1.0:
             remix_params['blend_enabled'] = True
 
-def get_remix_material_template(material_name, remix_params):
-    """
-    Generate Remix USD Material template
-    Only includes parameters that are actually present in the original material
-    
-    Args:
-        material_name (str): Name of the material
-        remix_params (dict): Remix parameters (may be pre-filtered)
-        
-    Returns:
-        str: Complete USD material content
-    """
-    
-    # Build parameter list for USD format
-    param_list = []
-    
-    # Check if emissive texture exists
-    has_emissive_texture = any(param_name == 'emissive_mask_texture' and param_value.startswith('./') 
-                              for param_name, param_value in remix_params.items())
-    
-    # Handle different parameter types for USD
-    for param_name, param_value in remix_params.items():
-        # Skip internal parameters that shouldn't be in USD
-        if param_name in ['filter_mode', 'wrap_mode_u', 'wrap_mode_v', 'encoding', 
-                         'sprite_sheet_fps', 'sprite_sheet_cols', 'sprite_sheet_rows',
-                         'preload_textures', 'ignore_material', 'alpha_test_type',
-                         'alpha_test_reference_value', 'displace_in', 'displace_out']:
-            continue
-        
-        # Skip the _original_params check - accept all parameters passed in
-        # This allows pre-filtered parameters to be included
-        
-        usd_param_name = f"inputs:{param_name}"
-        
-        # Handle texture parameters
-        if param_name.endswith('_texture') and isinstance(param_value, str):
-            if param_value.startswith('./'):
-                # This is a texture parameter with relative path
-                param_list.append(f'                asset {usd_param_name} = @{param_value}@')
-            elif param_value.startswith('D:/') or param_value.startswith('C:/'):
-                # Convert absolute path to relative path
-                import os
-                # Extract just the filename from the absolute path
-                filename = os.path.basename(param_value)
-                relative_path = f'./textures/{filename}'
-                param_list.append(f'                asset {usd_param_name} = @{relative_path}@')
-        
-        # Handle boolean parameters
-        elif isinstance(param_value, bool):
-            param_list.append(f'                bool {usd_param_name} = {1 if param_value else 0}')
-        
-        # Handle numeric parameters (int, float)
-        elif isinstance(param_value, (int, float)):
-            param_list.append(f'                float {usd_param_name} = {param_value}')
-        
-        # Handle string parameters (for constants, etc.)
-        elif isinstance(param_value, str):
-            param_list.append(f'                string {usd_param_name} = "{param_value}"')
-    
-    params_str = '\n'.join(param_list)
-    
-    # Generate the USD material template with the correct indentation structure
-    # This matches the original material's indentation (8 spaces base + 4 spaces relative)
-    template = f'''def Material "{material_name}" (
-            references = @./materials/AperturePBR_Opacity.usda@</Looks/mat_AperturePBR_Opacity>
-        )
-        {{
-            over "Shader"
-            {{
-{params_str}
-                token outputs:out (
-                    renderType = "material"
-                )
-            }}
-        }}'''
-    
-    return template
-
-def parse_principled_bsdf_from_usd(usd_content):
+def parse_principled_bsdf_from_usd(usd_content, usd_file_dir=None):
     """
     Parse Principled_BSDF materials from USD content
     
     Args:
         usd_content (str): USD file content
+        usd_file_dir (str): Directory of USD file for texture verification
         
     Returns:
         dict: Dictionary of material names to their parameters
@@ -613,8 +614,8 @@ def parse_principled_bsdf_from_usd(usd_content):
     
     materials = {}
     
-    # First, extract all texture file paths from the USD content
-    texture_paths = _extract_texture_paths(usd_content)
+    # First, extract all texture file paths from the USD content (with existence check)
+    texture_paths = _extract_texture_paths(usd_content, usd_file_dir)
     
     # Find all Material definitions using state machine for nested braces
     i = 0
@@ -689,42 +690,99 @@ def parse_principled_bsdf_from_usda_file(usda_file_path):
     with open(usda_file_path, 'r', encoding='utf-8') as f:
         usd_content = f.read()
     
-    return parse_principled_bsdf_from_usd(usd_content)
+    usd_file_dir = os.path.dirname(usda_file_path)
+    return parse_principled_bsdf_from_usd(usd_content, usd_file_dir)
+
+def parse_material(material_prim):
+    """Standardized parse function - parses Principled_BSDF or UsdPreviewSurface material from USD prim"""
+    return parse_principled_bsdf_material(material_prim)
 
 def parse_principled_bsdf_material(material_prim):
     """
-    Parse Principled_BSDF material from a single material prim
+    Parse Principled_BSDF or UsdPreviewSurface material from a single material prim.
+    UsdPreviewSurface is essentially PrincipledBSDF without the shader name (old Blender export).
     
     Args:
         material_prim: USD material prim
         
     Returns:
-        dict: Principled_BSDF parameters or None if not found
+        dict: Material parameters or None if not found
     """
     try:
-        # Get the stage content to parse Principled_BSDF
+        from pxr import UsdShade
+        
+        # Try UsdPreviewSurface detection first (more common in Blender exports)
+        material = UsdShade.Material(material_prim)
+        surface_output = material.GetSurfaceOutput()
+        
+        if surface_output:
+            connected_source = surface_output.GetConnectedSource()
+            if connected_source and len(connected_source) > 0 and connected_source[0]:
+                shader = UsdShade.Shader(connected_source[0])
+                shader_id = shader.GetIdAttr().Get()
+                
+                # Detect UsdPreviewSurface (old Blender format)
+                if shader_id == 'UsdPreviewSurface':
+                    return _parse_usdpreviewsurface_from_shader(shader, material_prim)
+        
+        # Fallback to Principled_BSDF text parsing
         stage_layer = material_prim.GetStage().GetRootLayer()
         stage_content = stage_layer.ExportToString()
         
-        # Parse Principled_BSDF materials from the content
-        principled_materials = parse_principled_bsdf_from_usd(stage_content)
+        import os
+        usd_file_path = stage_layer.identifier
+        usd_file_dir = os.path.dirname(usd_file_path) if usd_file_path else None
+        
+        principled_materials = parse_principled_bsdf_from_usd(stage_content, usd_file_dir)
         
         material_name = material_prim.GetName()
         if material_name in principled_materials:
             return principled_materials[material_name]
-        else:
-            return None
+        
+        return None
             
     except Exception as e:
-        print(f"Error parsing Principled_BSDF material {material_prim.GetName()}: {e}")
+        print(f"Error parsing material {material_prim.GetName()}: {e}")
         return None
 
+def _parse_usdpreviewsurface_from_shader(shader, material_prim):
+    """Parse UsdPreviewSurface shader inputs (same structure as PrincipledBSDF)"""
+    from pxr import UsdShade
+    params = {}
+    
+    shader_obj = UsdShade.Shader(shader) if not isinstance(shader, UsdShade.Shader) else shader
+    
+    for shader_input in shader_obj.GetInputs():
+        input_name = shader_input.GetBaseName()
+        
+        # Check if connected to texture
+        connected_source = shader_input.GetConnectedSource()
+        if connected_source and len(connected_source) > 0 and connected_source[0]:
+            # Texture connection
+            texture_shader = UsdShade.Shader(connected_source[0])
+            file_input = texture_shader.GetInput('file')
+            if file_input:
+                texture_path = file_input.Get()
+                if texture_path:
+                    clean_path = str(texture_path.path) if hasattr(texture_path, 'path') else str(texture_path)
+                    params[f"inputs:{input_name}"] = clean_path.strip('@')
+                    params[f"inputs:{input_name}_is_texture"] = True
+        else:
+            # Constant value
+            value = shader_input.Get()
+            if value is not None:
+                params[f"inputs:{input_name}"] = value
+    
+    return params
 
-def _extract_texture_paths(usd_content):
-    """Extract texture file paths from USD content"""
+
+def _extract_texture_paths(usd_content, usd_file_dir=None):
+    """Extract texture file paths from USD content and verify they exist"""
     import re
+    import os
     
     texture_paths = {}
+    texture_check_cache = {}  # Lookup table to avoid redundant file checks
     
     # Find all texture shaders and their file paths
     texture_pattern = r'def Shader "([^"]+)"\s*{[^}]*asset inputs:file\s*=\s*@([^@]+)@[^}]*}'
@@ -734,15 +792,30 @@ def _extract_texture_paths(usd_content):
         shader_name = match.group(1)
         file_path = match.group(2)
         
-        # For Principled_BSDF, textures are in ./textures/ relative to the input file
-        # No need to change the path - keep it as ./textures/
+        # Check cache first to avoid redundant file system checks
+        if file_path in texture_check_cache:
+            if texture_check_cache[file_path]:
+                texture_paths[shader_name] = file_path
+            continue
         
-        texture_paths[shader_name] = file_path
+        # Verify texture file exists (skip procedural/non-existent textures)
+        if usd_file_dir and file_path.startswith('./'):
+            full_path = os.path.join(usd_file_dir, file_path[2:])
+            exists = os.path.isfile(full_path)
+        else:
+            exists = os.path.isfile(file_path) if os.path.isabs(file_path) else True
+        
+        # Cache result
+        texture_check_cache[file_path] = exists
+        
+        # Only add if texture file exists
+        if exists:
+            texture_paths[shader_name] = file_path
     
     return texture_paths
 
 def _resolve_texture_connections(principled_params, texture_paths, material_name):
-    """Resolve texture connections to actual file paths"""
+    """Resolve texture connections to actual file paths with proper ./textures/ format"""
     resolved_params = principled_params.copy()
     
     for param_name, param_value in principled_params.items():
@@ -758,10 +831,40 @@ def _resolve_texture_connections(principled_params, texture_paths, material_name
                 if shader_match:
                     shader_name = shader_match.group(1)
                     if shader_name in texture_paths:
-                        # Replace the connection with the actual texture path
+                        # Get the actual texture file path from inputs:file
+                        texture_file_path = texture_paths[shader_name]
+                        
+                        # Extract the actual texture filename from the file path
+                        import os
+                        texture_filename = os.path.basename(texture_file_path)
+                        
+                        # FIX: If the filename is generic (like "Image_Texture_001.jpg"), 
+                        # use a meaningful name based on material name and texture type
+                        if texture_filename.startswith('Image_Texture') or texture_filename.startswith('image_texture'):
+                            # Determine texture type from parameter name
+                            base_param = param_name[:-8]  # Remove '.connect'
+                            texture_type_map = {
+                                'diffuseColor': 'BaseColor',
+                                'metallic': 'Metallic',
+                                'roughness': 'Roughness',
+                                'normal': 'Normal',
+                                'emissiveColor': 'Emissive',
+                                'opacity': 'Opacity',
+                                'anisotropy': 'Anisotropy'
+                            }
+                            texture_type = texture_type_map.get(base_param, base_param)
+                            
+                            # Get file extension
+                            file_ext = os.path.splitext(texture_filename)[1]
+                            
+                            # Create meaningful filename: MaterialName_TextureType.ext
+                            texture_filename = f"{material_name}_{texture_type}{file_ext}"
+                        
+                        formatted_path = f"./textures/{texture_filename}"
+                        
+                        # Replace the connection with the formatted texture path
                         base_param = param_name[:-8]  # Remove '.connect'
-                        # Add the texture path with the correct parameter name
-                        resolved_params[base_param] = texture_paths[shader_name]
+                        resolved_params[base_param] = formatted_path
                         # Mark this as a texture parameter by adding a special suffix
                         resolved_params[f"{base_param}_is_texture"] = True
                         # Remove the connection parameter

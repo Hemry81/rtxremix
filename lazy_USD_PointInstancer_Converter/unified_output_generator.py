@@ -7,13 +7,71 @@ Only generates output from prepared data - no data processing
 import os
 import time
 import shutil
+import sys
+import contextlib
 from pxr import Usd, UsdGeom, UsdShade, Sdf, Gf
 from nvidia_texture_converter import NvidiaTextureConverter
+from omnipbr_converter import parse_omnipbr_mdl
+
+@contextlib.contextmanager
+def suppress_usd_warnings():
+    """Suppress AperturePBR_Opacity.usda reference warnings"""
+    import io
+    old_stderr = sys.stderr
+    
+    class FilteredStderr:
+        def __init__(self):
+            self.current_line = ''
+            self.skip_next_blank = False
+        
+        def write(self, text):
+            self.current_line += text
+            while '\n' in self.current_line:
+                line, self.current_line = self.current_line.split('\n', 1)
+                line += '\n'
+                if self.skip_next_blank and line.strip() == '':
+                    self.skip_next_blank = False
+                    continue
+                skip_line = (
+                    'AperturePBR_Opacity.usda' in line or
+                    'Could not open asset' in line or
+                    '_ReportErrors' in line or
+                    'recomposing stage' in line or
+                    'for reference introduced by' in line or
+                    '@C:/Users/materials/' in line
+                )
+                if not skip_line:
+                    old_stderr.write(line)
+                else:
+                    self.skip_next_blank = True
+        
+        def flush(self):
+            if self.current_line:
+                skip_line = (
+                    'AperturePBR_Opacity.usda' in self.current_line or
+                    'Could not open asset' in self.current_line or
+                    '_ReportErrors' in self.current_line or
+                    'recomposing stage' in self.current_line or
+                    'for reference introduced by' in self.current_line or
+                    '@C:/Users/materials/' in self.current_line
+                )
+                if not skip_line and self.current_line.strip():
+                    old_stderr.write(self.current_line)
+                self.current_line = ''
+            self.skip_next_blank = False
+            old_stderr.flush()
+    
+    sys.stderr = FilteredStderr()
+    try:
+        yield
+    finally:
+        sys.stderr.flush()
+        sys.stderr = old_stderr
 
 class FinalOutputGenerator:
     """Final simplified output generation - only generates output from prepared data"""
     
-    def __init__(self, output_data, output_path, use_external_references=False, export_binary=False, input_stage=None, convert_textures=False, normal_map_format="Auto-Detect", interpolation_mode="faceVarying"):
+    def __init__(self, output_data, output_path, use_external_references=False, export_binary=False, input_stage=None, convert_textures=False, normal_map_format="Auto-Detect", interpolation_mode="faceVarying", remove_geomsubset_familyname=True, generate_missing_uvs=False):
         self.output_data = output_data
         self.output_path = output_path
         self.use_external_references = use_external_references
@@ -23,6 +81,8 @@ class FinalOutputGenerator:
         self.convert_textures = convert_textures
         self.normal_map_format = normal_map_format
         self.interpolation_mode = interpolation_mode
+        self.remove_geomsubset_familyname = remove_geomsubset_familyname
+        self.generate_missing_uvs = generate_missing_uvs
         
         # Initialize texture converter if enabled (with GPU acceleration, output to textures/)
         self.texture_converter = NvidiaTextureConverter(use_gpu=True, gpu_device=0) if convert_textures else None
@@ -30,59 +90,99 @@ class FinalOutputGenerator:
         # Texture conversion tracking to avoid duplicate conversions
         self.texture_conversion_cache = {}  # Maps source_file -> output_file
         self.textures_being_converted = set()  # Track files currently being converted
+        self.failed_texture_conversions = []  # Track failed conversions with details
+        
+        # Counters for summary
+        self.geomsubset_fixes = 0
+        self.materials_cleaned = 0
+        
+        # Find and store mod.usda path for refresh
+        self.mod_file = self._find_mod_file()
+        
+        # Initialize UV status tracking lists (accumulate across all files)
+        self.meshes_without_uvs = []
+        self.meshes_with_generated_uvs = []
+        self.meshes_failed_uv_generation = []
+        
+        # Face count tracking
+        self.prototype_face_counts = {}  # {prototype_name: face_count}
+        self.instance_counts = {}  # {prototype_name: instance_count}
+        self.blender_names = {}  # {prototype_name: blender_name}
         
     def generate_output(self):
         """Main output generation method"""
         print(f"OUTPUT Generating output from prepared data...")
         
-        try:
-            # Create stage
-            output_stage = self._create_stage()
+        # Create stage
+        output_stage = self._create_stage()
+        
+        # Copy materials
+        self._copy_materials(output_stage)
+        
+        # Remove old root-level materials after successful RTX conversion
+        self._remove_old_root_materials_after_conversion(output_stage)
+        
+        # Create unique objects
+        self._create_unique_objects(output_stage)
+        
+        # Initialize face counting flag
+        self._faces_counted = False
+        
+        # Create PointInstancers
+        pointinstancer_count = self._create_pointinstancers(output_stage)
+        
+        # Calculate face counts if not already done (for non-external-ref modes)
+        if not self._faces_counted:
+            self._calculate_face_counts(output_stage)
+        
+        # Create external files if needed
+        external_files_created = 0
+        if self.use_external_references:
+            external_files_created = self._create_external_files()
             
-            # Copy materials
-            self._copy_materials(output_stage)
-            
-            # Remove old root-level materials after successful RTX conversion
-            self._remove_old_root_materials_after_conversion(output_stage)
-            
-            # Create unique objects
-            self._create_unique_objects(output_stage)
-            
-            # Create PointInstancers
-            pointinstancer_count = self._create_pointinstancers(output_stage)
-            
-            # Create external files if needed
-            external_files_created = 0
-            if self.use_external_references:
-                external_files_created = self._create_external_files()
-                
-                # CLEANUP: Remove unused materials from main file after external references are created
-                self._remove_unused_materials_from_main_file(output_stage)
+            # CLEANUP: Remove unused materials from main file after external references are created
+            self._remove_unused_materials_from_main_file(output_stage)
 
-            # Convert textures directly from source (no wasteful copying)
-            textures_converted = 0
-            if self.convert_textures:
-                textures_converted = self._convert_textures_direct()
-            
-            # Save stage
-            output_stage.Save()
-            
-            return {
-                'pointinstancers_processed': pointinstancer_count,
-                'external_files_created': external_files_created,
-                'materials_converted': len(self.output_data['materials']),
-                'textures_converted': textures_converted,
-                'operation': f"{self.output_data.get('input_type', 'unknown')}_{'external' if self.use_external_references else 'inline'}"
-            }
-                
-        except Exception as e:
-            print(f"ERROR Failed to generate output: {e}")
-            return None
+        # Convert textures directly from source (no wasteful copying)
+        textures_converted = 0
+        if self.convert_textures:
+            textures_converted = self._convert_textures_direct()
+        
+        # CRITICAL: Apply unified mesh fixes to ALL meshes after structure is complete
+        self._apply_final_mesh_fixes(output_stage)
+        
+        # FINAL STEP: Assign all material bindings (suppresses USD warnings)
+        with suppress_usd_warnings():
+            self._assign_all_material_bindings(output_stage)
+        
+        # Save stage
+        output_stage.Save()
+        
+        # Print summary
+        if self.geomsubset_fixes > 0:
+            print(f"FIX Removed familyName from {self.geomsubset_fixes} GeomSubsets")
+        if self.materials_cleaned > 0:
+            print(f"CLEANUP Removed {self.materials_cleaned} old Blender material scopes")
+        
+        return {
+            'pointinstancers_processed': pointinstancer_count,
+            'external_files_created': external_files_created,
+            'materials_converted': len(self.output_data['materials']),
+            'textures_converted': textures_converted,
+            'instance_counts': self.instance_counts,
+            'blender_names': self.blender_names,
+            'texture_details': getattr(self, '_texture_details', []),
+            'meshes_without_uvs': getattr(self, 'meshes_without_uvs', []),
+            'meshes_with_generated_uvs': getattr(self, 'meshes_with_generated_uvs', []),
+            'meshes_failed_uv_generation': getattr(self, 'meshes_failed_uv_generation', []),
+            'operation': f"{self.output_data.get('input_type', 'unknown')}_{'external' if self.use_external_references else 'inline'}",
+            'prototype_face_counts': self.prototype_face_counts,
+            'failed_texture_conversions': self.failed_texture_conversions
+        }
     
     def _create_stage(self):
         """Create and configure output stage"""
         output_stage = Usd.Stage.CreateNew(self.output_path)
-        
         # Set file format
         layer = output_stage.GetRootLayer()
         if self.export_binary:
@@ -120,13 +220,15 @@ class FinalOutputGenerator:
         # Create materials scope
         materials_scope = output_stage.DefinePrim("/Root/Looks", "Scope")
         
+        # Remix materials are now created inline, no external files needed
+        
         for material_name, material_info in self.output_data['materials'].items():
             target_path = f"/Root/Looks/{material_name}"
             
             # Check if this is a Remix material
             if material_info.get('is_remix', False):
-                 # Create Remix material
-                 self._create_remix_material(output_stage, target_path, material_info, is_external=False)
+                # Create Remix material
+                self._create_remix_material(output_stage, target_path, material_info, is_external=False)
             else:
                 # Copy original material as-is
                 source_material = material_info['prim']
@@ -172,7 +274,7 @@ class FinalOutputGenerator:
         
     
     def _create_remix_material(self, output_stage, target_path, material_info, is_external=False):
-        """Create Remix material with AperturePBR_Opacity reference"""
+        """Create Remix material with reference to AperturePBR_Opacity.usda"""
         try:
             material_name = os.path.basename(target_path)
             conversion_type = material_info.get('conversion_type', 'unknown')
@@ -185,10 +287,12 @@ class FinalOutputGenerator:
             # Create the material in the target stage
             target_material = output_stage.DefinePrim(target_path, "Material")
             
-            # Add reference to AperturePBR_Opacity
+            # Add reference to AperturePBR_Opacity.usda using auto-calculated path
             references = target_material.GetReferences()
-            # Calculate proper relative path from output file to materials directory
+            # For external files in Instance_Objs/, add ../ prefix
             material_ref_path = self._get_materials_reference_path()
+            if is_external:
+                material_ref_path = "../" + material_ref_path
             references.AddReference(material_ref_path, "/Looks/mat_AperturePBR_Opacity")
             
             # Create Shader prim with Remix parameters (use OverridePrim for proper RTX Remix format)
@@ -198,7 +302,13 @@ class FinalOutputGenerator:
             # Set Remix parameters with adjusted texture paths for external files
             self._set_remix_shader_parameters(shader_prim, remix_params, is_external)
             
-
+            # Note: blend_enabled is now handled in the main parameter loop
+            # It is only added when it differs from defaults (opacity texture exists)
+            
+            # CRITICAL: Connect shader output to material surface output
+            material = UsdShade.Material(target_material)
+            shader = UsdShade.Shader(shader_prim)
+            material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "out")
             
         except Exception as e:
             print(f"ERROR Failed to create Remix material {material_name}: {e}")
@@ -206,31 +316,62 @@ class FinalOutputGenerator:
             print(f"Details: {traceback.format_exc()}")
     
     def _set_remix_shader_parameters(self, shader_prim, remix_params, is_external=False):
-        """Set Remix shader parameters with proper types"""
+        """Set Remix shader parameters with proper types - ONLY parameters from original material"""
         try:
             from pxr import Sdf, Gf
             
-            for param_name, param_value in remix_params.items():
-                # Skip parameters that don't need to be set
-                if param_name in ['enable_emission', 'enable_thin_film', 'use_legacy_alpha_state', 'blend_enabled', 'preload_textures', 'ignore_material', '_original_params']:
+            # Get original parameters to only set what was in the source
+            original_params = remix_params.get('_original_params', set())
+            
+            # Add blend_enabled and use_legacy_alpha_state when set by material mapper
+            if remix_params.get('blend_enabled') is True:
+                original_params.add('blend_enabled')
+            if 'use_legacy_alpha_state' in remix_params:
+                original_params.add('use_legacy_alpha_state')
+            
+            # If no original params tracked, don't set any parameters (avoid defaults)
+            if not original_params:
+                return
+            
+            for param_name in original_params:
+                # Skip internal metadata
+                if param_name.startswith('_'):
                     continue
                 
-                # Adjust texture paths for external files
-                if is_external and isinstance(param_value, str) and param_value.startswith('./textures/'):
-                    param_value = param_value.replace('./textures/', '../textures/')
+                # Get the parameter value
+                if param_name not in remix_params:
+                    continue
+                    
+                param_value = remix_params[param_name]
                 
-                # Convert texture paths to DDS extension if texture conversion is enabled
-                if self.convert_textures and isinstance(param_value, str) and param_name.endswith('_texture'):
-                    if not param_value.endswith('.dds') and any(ext in param_value.lower() for ext in ['.png', '.jpg', '.jpeg', '.tga']):
-                        # Extract filename without extension and add .dds
-                        base_name = os.path.splitext(param_value)[0]
-                        param_value = f"{base_name}.dds"
+                # Convert texture paths with proper prefix based on location
+                if isinstance(param_value, str) and param_name.endswith('_texture'):
+                    clean_value = param_value.strip('@')
+                    
+                    if clean_value:
+                        filename = os.path.basename(clean_value)
+                        base_name = os.path.splitext(filename)[0]
+                        # For external files in Instance_Objs/, use ../textures/
+                        if is_external:
+                            param_value = f"../textures/{base_name}.dds"
+                        else:
+                            param_value = f"./textures/{base_name}.dds"
                 
                 # Determine parameter type and convert value
                 param_type = None
                 converted_value = None
                 
-                if isinstance(param_value, bool):
+                # CRITICAL: Check Gf.Vec3f FIRST (already converted from tuple in data converter)
+                if isinstance(param_value, Gf.Vec3f):
+                    # Already a Vec3f - use as Color3f
+                    param_type = Sdf.ValueTypeNames.Color3f
+                    converted_value = param_value
+                # Check tuple/list for color constants
+                elif isinstance(param_value, (tuple, list)) and len(param_value) == 3:
+                    # Handle color tuples (r, g, b)
+                    param_type = Sdf.ValueTypeNames.Color3f
+                    converted_value = Gf.Vec3f(float(param_value[0]), float(param_value[1]), float(param_value[2]))
+                elif isinstance(param_value, bool):
                     param_type = Sdf.ValueTypeNames.Bool
                     converted_value = param_value
                 elif isinstance(param_value, int):
@@ -240,8 +381,13 @@ class FinalOutputGenerator:
                     param_type = Sdf.ValueTypeNames.Float
                     converted_value = param_value
                 elif isinstance(param_value, str):
+                    # CRITICAL: Check for texture parameters FIRST before other string handling
+                    if param_name.endswith('_texture'):
+                        # Texture paths (DDS conversion already handled above)
+                        param_type = Sdf.ValueTypeNames.Asset
+                        converted_value = Sdf.AssetPath(param_value)
                     # Handle string values that need specific types
-                    if param_name.endswith('_constant') and param_value.startswith('color('):
+                    elif param_name.endswith('_constant') and param_value.startswith('color('):
                         # Color values like "color(0.8, 0.8, 0.8)"
                         try:
                             # Extract RGB values from "color(r, g, b)"
@@ -252,10 +398,6 @@ class FinalOutputGenerator:
                         except:
                             param_type = Sdf.ValueTypeNames.String
                             converted_value = param_value
-                    elif param_name.endswith('_texture'):
-                        # Texture paths (DDS conversion already handled above)
-                        param_type = Sdf.ValueTypeNames.Asset
-                        converted_value = param_value
                     elif param_value.endswith('f'):
                         # Float values like "0.0f"
                         try:
@@ -273,7 +415,10 @@ class FinalOutputGenerator:
                     # Skip unknown types
                     continue
                 
-                # Create and set the parameter
+                # Create and set the parameter - skip if no valid type determined
+                if param_type is None or converted_value is None:
+                    continue
+                
                 try:
                     # Set custom=False for non-string attributes (like unified_instancer_converter.py)
                     # Only string values should be custom, all others should not be custom
@@ -290,28 +435,24 @@ class FinalOutputGenerator:
     
     def _create_unique_objects(self, output_stage):
         """Create unique objects from prepared data with proper hierarchy"""
-        # For reverse conversion, we need to create proper parent containers
-        if self.conversion_type == 'reverse':
-            self._create_reverse_output_structure(output_stage)
-        else:
-            # Forward conversion - use existing logic
-            # First, create anchor meshes (parents)
-            anchor_meshes = {}
-            for unique_object_data in self.output_data['unique_objects']:
-                if unique_object_data['type'] == 'anchor_mesh':
-                    # Create anchor mesh as parent container
-                    anchor_prim = self._create_anchor_mesh(output_stage, unique_object_data)
-                    anchor_meshes[unique_object_data['path']] = anchor_prim
-            
-            # Then, create children (PointInstancers and single instances) under their parent anchors
-            for unique_object_data in self.output_data['unique_objects']:
-                if unique_object_data['type'] == 'single_instance':
-                    # Create single instance under its parent anchor
-                    self._create_single_instance(output_stage, unique_object_data)
-            
-            # Create PointInstancers under their parent anchors
-            for pointinstancer_data in self.output_data['pointinstancers']:
-                self._create_pointinstancer(output_stage, pointinstancer_data)
+        # Unified approach for all conversion types
+        # First, create anchor meshes (parents)
+        anchor_meshes = {}
+        for unique_object_data in self.output_data['unique_objects']:
+            if unique_object_data['type'] == 'anchor_mesh':
+                # Create anchor mesh as parent container
+                anchor_prim = self._create_anchor_mesh(output_stage, unique_object_data)
+                anchor_meshes[unique_object_data['path']] = anchor_prim
+        
+        # Then, create children (PointInstancers and single instances) under their parent anchors
+        for unique_object_data in self.output_data['unique_objects']:
+            if unique_object_data['type'] == 'single_instance':
+                # Create single instance under its parent anchor
+                self._create_single_instance(output_stage, unique_object_data)
+        
+        # Create PointInstancers under their parent anchors (unified for all conversion types)
+        for pointinstancer_data in self.output_data['pointinstancers']:
+            self._create_pointinstancer(output_stage, pointinstancer_data)
     
     def _create_anchor_mesh(self, output_stage, mesh_data):
         """Create anchor mesh (parent container)"""
@@ -330,44 +471,11 @@ class FinalOutputGenerator:
             # Get the copied mesh prim for material binding
             mesh_child_prim = output_stage.GetPrimAtPath(mesh_child_path)
             
-            # Set material binding
+            # Store material binding for final assignment
             if mesh_data['material_binding']:
-                material_binding_api = UsdShade.MaterialBindingAPI(mesh_child_prim)
-                # Handle material binding as dictionary or string
-                if isinstance(mesh_data['material_binding'], dict):
-                    material_path = mesh_data['material_binding'].get('target_path', '')
-                else:
-                    material_path = str(mesh_data['material_binding'])
-                if material_path and material_path.strip():
-                    try:
-                        # Extract material name from path and create correct path
-                        material_name = None
-                        if '/_materials/' in material_path:
-                            material_name = material_path.split('/_materials/')[-1]
-                        elif '/root/Looks/' in material_path:
-                            material_name = material_path.split('/root/Looks/')[-1]
-                        elif '/Root/Looks/' in material_path:
-                            material_name = material_path.split('/Root/Looks/')[-1]
-                        elif '/Looks/' in material_path:
-                            material_name = material_path.split('/Looks/')[-1]
-                        elif '/root/prototypes/' in material_path:
-                            # Handle prototype material references
-                            parts = material_path.split('/')
-                            if len(parts) >= 4:
-                                material_name = parts[-1]  # Get the material name from the end
-                        
-                        if material_name:
-                            correct_material_path = f"/Root/Looks/{material_name}"
-                            material_prim = mesh_child_prim.GetStage().GetPrimAtPath(Sdf.Path(correct_material_path))
-                            if material_prim:
-                                material_binding_api.Bind(UsdShade.Material(material_prim))
-                
-                            else:
-                                print(f"WARNING Material not found at {correct_material_path}")
-                        else:
-                            print(f"WARNING Could not extract material name from {material_path}")
-                    except Exception as e:
-                        print(f"WARNING Failed to bind material {material_path}: {e}")
+                if not hasattr(self, '_pending_bindings'):
+                    self._pending_bindings = []
+                self._pending_bindings.append((mesh_child_path, mesh_data['material_binding']))
         
         # Set transform on the anchor container
         if mesh_data.get('transform') and mesh_data['transform'] != Gf.Matrix4d(1.0):
@@ -403,44 +511,11 @@ class FinalOutputGenerator:
             if instance_data.get('scale'):
                 xformable.AddScaleOp().Set(instance_data['scale'])
         
-        # Set material binding
+        # Store material binding for final assignment
         if instance_data['material_binding']:
-            material_binding_api = UsdShade.MaterialBindingAPI(instance_prim)
-            # Handle material binding as dictionary or string
-            if isinstance(instance_data['material_binding'], dict):
-                material_path = instance_data['material_binding'].get('target_path', '')
-            else:
-                material_path = str(instance_data['material_binding'])
-            if material_path and material_path.strip():
-                try:
-                    # Extract material name from path and create correct path
-                    material_name = None
-                    if '/_materials/' in material_path:
-                        material_name = material_path.split('/_materials/')[-1]
-                    elif '/root/Looks/' in material_path:
-                        material_name = material_path.split('/root/Looks/')[-1]
-                    elif '/Root/Looks/' in material_path:
-                        material_name = material_path.split('/Root/Looks/')[-1]
-                    elif '/Looks/' in material_path:
-                        material_name = material_path.split('/Looks/')[-1]
-                    elif '/root/prototypes/' in material_path:
-                        # Handle prototype material references
-                        parts = material_path.split('/')
-                        if len(parts) >= 4:
-                            material_name = parts[-1]  # Get the material name from the end
-                    
-                    if material_name:
-                        correct_material_path = f"/Root/Looks/{material_name}"
-                        material_prim = instance_prim.GetStage().GetPrimAtPath(Sdf.Path(correct_material_path))
-                        if material_prim:
-                            material_binding_api.Bind(UsdShade.Material(material_prim))
-
-                        else:
-                            print(f"WARNING Material not found at {correct_material_path}")
-                    else:
-                        print(f"WARNING Could not extract material name from {material_path}")
-                except Exception as e:
-                    print(f"WARNING Failed to bind material {material_path}: {e}")
+            if not hasattr(self, '_pending_bindings'):
+                self._pending_bindings = []
+            self._pending_bindings.append((instance_path, instance_data['material_binding']))
     
     # ========================================
     # REVERSE CONVERSION METHODS
@@ -448,6 +523,11 @@ class FinalOutputGenerator:
     
     def _create_reverse_output_structure(self, output_stage):
         """Create proper hierarchy structure for reverse conversion"""
+        # First, create anchor meshes (parent containers with their meshes)
+        for unique_object_data in self.output_data['unique_objects']:
+            if unique_object_data['type'] == 'anchor_mesh':
+                self._create_anchor_mesh(output_stage, unique_object_data)
+        
         # For reverse conversion, we need to create parent containers and nest PointInstancers
         # Get parent information from the unified data
         parent_groups = {}
@@ -623,6 +703,11 @@ class FinalOutputGenerator:
     
     def _create_pointinstancer_from_data(self, output_stage, instancer_path, pointinstancer_data):
         """Create PointInstancer from prepared data"""
+        # Store blender_name for reporting
+        if 'blender_name' in pointinstancer_data and pointinstancer_data['blender_name']:
+            proto_name = pointinstancer_data.get('prototype_name', pointinstancer_data.get('name', 'Unknown'))
+            self.blender_names[proto_name] = pointinstancer_data['blender_name']
+        
         # Create PointInstancer
         instancer = UsdGeom.PointInstancer.Define(output_stage, instancer_path)
         
@@ -853,7 +938,8 @@ class FinalOutputGenerator:
                 
                 # Skip the first instance (likely base prototype reference at 0,0,0)
                 if instance_count == 1:
-                    print(f"FILTER: Skipping first instance {instance_data.get('blender_name', instance_data['path'])} (likely base prototype reference)")
+                    instance_name = instance_data.get('blender_name') or instance_data.get('path', 'Unknown')
+                    print(f"FILTER: Skipping first instance {instance_name} (likely base prototype reference)")
                     continue
                 
                 transform_matrix = instance_data.get('transform')
@@ -902,27 +988,61 @@ class FinalOutputGenerator:
 
             
         else:
-            # Existing PointInstancer - copy original attributes
+            # Existing PointInstancer - copy original attributes with array expansion
             source_instancer = pointinstancer_data['prim']
             source_pi = UsdGeom.PointInstancer(source_instancer)
             
-            # Copy all PointInstancer attributes
+            # Get transform array lengths to determine valid instance count
+            positions_attr = source_instancer.GetPrim().GetAttribute('positions')
+            orientations_attr = source_instancer.GetPrim().GetAttribute('orientations')
+            scales_attr = source_instancer.GetPrim().GetAttribute('scales')
+            proto_indices_attr = source_instancer.GetPrim().GetAttribute('protoIndices')
+            
+            positions = positions_attr.Get() if positions_attr and positions_attr.HasValue() else None
+            orientations = orientations_attr.Get() if orientations_attr and orientations_attr.HasValue() else None
+            scales = scales_attr.Get() if scales_attr and scales_attr.HasValue() else None
+            proto_indices = proto_indices_attr.Get() if proto_indices_attr else None
+            
+            # Determine the valid instance count (minimum of all array lengths)
+            valid_instance_count = None
+            if positions:
+                valid_instance_count = len(positions)
+            if orientations and (valid_instance_count is None or len(orientations) < valid_instance_count):
+                valid_instance_count = len(orientations)
+            if scales and (valid_instance_count is None or len(scales) < valid_instance_count):
+                valid_instance_count = len(scales)
+            
+            # Truncate protoIndices if it's longer than transform arrays
+            if proto_indices and valid_instance_count and len(proto_indices) > valid_instance_count:
+                proto_indices = proto_indices[:valid_instance_count]
+            
+            # Copy all PointInstancer attributes FIRST (including protoIndices)
             for attr in source_instancer.GetPrim().GetAttributes():
                 if not attr.GetName().startswith('__'):
+                    attr_name = attr.GetName()
                     try:
-                        target_attr = instancer.GetPrim().GetAttribute(attr.GetName())
-                        if target_attr and attr.HasValue():
-                            target_attr.Set(attr.Get())
+                        value = attr.Get() if attr.HasValue() else None
+                        if value is not None:
+                            target_attr = instancer.GetPrim().GetAttribute(attr_name)
+                            if not target_attr:
+                                target_attr = instancer.GetPrim().CreateAttribute(attr_name, attr.GetTypeName())
+                            target_attr.Set(value)
                     except Exception as e:
                         print(f"WARNING Could not copy PointInstancer attribute {attr.GetName()}: {e}")
             
-            # Copy prototype relationships
+            # THEN overwrite protoIndices with truncated version (AFTER all attributes copied)
+            if proto_indices is not None:
+                instancer.GetProtoIndicesAttr().Set(proto_indices)
+            
+            # Copy prototype relationships with path standardization
             source_prototypes = source_pi.GetPrototypesRel()
             if source_prototypes:
                 target_prototypes = instancer.GetPrototypesRel()
                 targets = source_prototypes.GetTargets()
                 if targets:
-                    target_prototypes.SetTargets(targets)
+                    # Standardize paths from /root/ to /Root/
+                    updated_targets = [Sdf.Path(str(t).replace('/root/', '/Root/')) for t in targets]
+                    target_prototypes.SetTargets(updated_targets)
             
     
     
@@ -934,9 +1054,155 @@ class FinalOutputGenerator:
             return 0
         
         pointinstancer_count = 0
+        processed_parents = set()  # Track which parent containers we've already processed
         
         for pointinstancer_data in self.output_data['pointinstancers']:
-            if pointinstancer_data['type'] == 'pointinstancer':
+            # For Blender 4.5 with parent preservation, copy entire parent once
+            if pointinstancer_data.get('preserve_parent'):
+                parent_path = pointinstancer_data.get('parent_path')
+                if parent_path and parent_path not in processed_parents:
+                    processed_parents.add(parent_path)
+                    source_instancer_prim = pointinstancer_data['prim']
+                    source_parent = source_instancer_prim.GetParent()
+                    if source_parent:
+                        # Copy parent container but only PointInstancer and mesh_base children
+                        # For Blender 4.5, respect user's interpolation mode choice
+                        skip_fixes = (self.interpolation_mode == "none")
+                        
+                        # Copy parent Xform without children first
+                        self.copy_prim_data(source_parent, output_stage, parent_path, include_materials=True, include_children=False, skip_interpolation_fixes=skip_fixes)
+                        
+                        # Only copy PointInstancer and mesh_base children, skip original prototype objects
+                        instancer_name = source_instancer_prim.GetName()
+                        for child in source_parent.GetChildren():
+                            child_name = child.GetName()
+                            # Only copy the PointInstancer and mesh_base, skip everything else
+                            if child_name == instancer_name or child_name == "mesh_base":
+                                child_path = f"{parent_path}/{child_name}"
+                                self.copy_prim_data(child, output_stage, child_path, include_materials=True, include_children=True, skip_interpolation_fixes=skip_fixes)
+                        
+                        pointinstancer_count += 1
+                        
+                        # Fix PointInstancer prototype paths from /root/ to /Root/
+                        instancer_path = f"{parent_path}/{instancer_name}"
+                        copied_instancer = output_stage.GetPrimAtPath(instancer_path)
+                        if copied_instancer and copied_instancer.IsValid():
+                            # Truncate protoIndices if needed (prevent Blender 4.5.4 export bug)
+                            pi = UsdGeom.PointInstancer(copied_instancer)
+                            positions_attr = copied_instancer.GetAttribute('positions')
+                            proto_indices_attr = copied_instancer.GetAttribute('protoIndices')
+                            if positions_attr and proto_indices_attr:
+                                positions = positions_attr.Get() if positions_attr.HasValue() else None
+                                proto_indices = proto_indices_attr.Get() if proto_indices_attr.HasValue() else None
+                                if positions and proto_indices and len(proto_indices) > len(positions):
+                                    truncated_proto_indices = proto_indices[:len(positions)]
+                                    pi.GetProtoIndicesAttr().Set(truncated_proto_indices)
+                            
+                            pi = UsdGeom.PointInstancer(copied_instancer)
+                            proto_rel = pi.GetPrototypesRel()
+                            if proto_rel:
+                                old_targets = proto_rel.GetTargets()
+                                
+                                # If using external references, replace inline prototypes with external Xforms
+                                if self.use_external_references:
+                                    # Remove inline Prototypes folder
+                                    prototypes_folder = output_stage.GetPrimAtPath(f"{instancer_path}/Prototypes")
+                                    if prototypes_folder and prototypes_folder.IsValid():
+                                        output_stage.RemovePrim(f"{instancer_path}/Prototypes")
+                                        print(f"CLEANUP Removed inline Prototypes folder for external references")
+                                    
+                                    # Create external reference Xforms for each prototype
+                                    new_targets = []
+                                    for i, old_target in enumerate(old_targets):
+                                        # Get the mesh name from the old target
+                                        old_prim = self.input_stage.GetPrimAtPath(old_target)
+                                        if old_prim and old_prim.IsValid():
+                                            mesh_prim = None
+                                            material_binding = None
+                                            if old_prim.IsA(UsdGeom.Mesh):
+                                                mesh_prim = old_prim
+                                            else:
+                                                # Recursively search for mesh (handles Xform wrappers)
+                                                def find_mesh_recursive(prim):
+                                                    for child in prim.GetAllChildren():
+                                                        if child.IsA(UsdGeom.Mesh):
+                                                            return child
+                                                        if child.IsA(UsdGeom.Xform):
+                                                            result = find_mesh_recursive(child)
+                                                            if result:
+                                                                return result
+                                                    return None
+                                                
+                                                mesh_prim = find_mesh_recursive(old_prim)
+                                            
+                                            # Get material binding from mesh
+                                            if mesh_prim:
+                                                binding_rel = mesh_prim.GetRelationship('material:binding')
+                                                if binding_rel:
+                                                    targets = binding_rel.GetTargets()
+                                                    if targets:
+                                                        material_binding = targets[0]
+                                            
+                                            if mesh_prim:
+                                                mesh_name = mesh_prim.GetName()
+                                                ext_ref_path = f"{instancer_path}/{mesh_name}"
+                                                ext_ref_prim = output_stage.DefinePrim(ext_ref_path, "Xform")
+                                                ext_ref_prim.SetMetadata("kind", "component")
+                                                
+                                                external_file = f"./Instance_Objs/{mesh_name}.usd"
+                                                references = ext_ref_prim.GetReferences()
+                                                references.AddReference(external_file)
+                                                
+                                                new_targets.append(Sdf.Path(ext_ref_path))
+                                    
+                                    proto_rel.SetTargets(new_targets)
+                                    print(f"CLEANUP Replaced inline prototypes with {len(new_targets)} external references")
+                                    
+                                    # Remove old Prototype_* Xforms that are no longer needed
+                                    for child in copied_instancer.GetChildren():
+                                        child_name = child.GetName()
+                                        if child_name.startswith('Prototype_') and child.GetTypeName() == 'Xform':
+                                            # Check if this is NOT one of our new mesh-named references
+                                            if child.GetPath() not in new_targets:
+                                                output_stage.RemovePrim(child.GetPath())
+                                                print(f"CLEANUP Removed old prototype Xform: {child_name}")
+                                else:
+                                    # Just fix paths for inline mode
+                                    new_targets = [Sdf.Path(str(t).replace('/root/', '/Root/')) for t in old_targets]
+                                    proto_rel.SetTargets(new_targets)
+                                    print(f"CLEANUP Fixed prototype paths: /root/ ??/Root/")
+                        
+                        
+                        # Remove extra prototype reference objects (Plane_001_64255959, etc.)
+                        # These are the source prototype containers that shouldn't be in output
+                        parent_prim = output_stage.GetPrimAtPath(parent_path)
+                        if parent_prim and parent_prim.IsValid():
+                            extra_objects_to_remove = []
+                            for child in parent_prim.GetChildren():
+                                child_name = child.GetName()
+                                # Remove objects that match Blender's prototype naming pattern
+                                if ('_' in child_name and child_name not in [instancer_name, f"{instancer_name}_base"]):
+                                    # Check if it contains a mesh and _materials (prototype reference pattern)
+                                    has_mesh = False
+                                    has_materials = False
+                                    for subchild in child.GetChildren():
+                                        if subchild.IsA(UsdGeom.Mesh):
+                                            has_mesh = True
+                                        if subchild.GetName() == '_materials':
+                                            has_materials = True
+                                    if has_mesh and has_materials:
+                                        extra_objects_to_remove.append(child.GetPath())
+                            
+                            for obj_path in extra_objects_to_remove:
+                                output_stage.RemovePrim(obj_path)
+                                print(f"CLEANUP Removed extra prototype reference: {obj_path.name}")
+                        
+                        # Remove old lowercase /root prim if it exists
+                        old_root = output_stage.GetPrimAtPath('/root')
+                        if old_root and old_root.IsValid():
+                            output_stage.RemovePrim('/root')
+                            print(f"CLEANUP Removed duplicate lowercase /root prim")
+            elif pointinstancer_data['type'] == 'pointinstancer':
                 self._create_pointinstancer(output_stage, pointinstancer_data)
                 pointinstancer_count += 1
             elif pointinstancer_data['type'] == 'existing_pointinstancer':
@@ -977,47 +1243,63 @@ class FinalOutputGenerator:
             # Create external stage using temporary file approach (like old converter)
             try:
                 import tempfile
-                import shutil
                 
-                # Create a temporary file to avoid USD layer caching issues
-                with tempfile.NamedTemporaryFile(suffix=".usda", delete=False) as temp_file:
-                    temp_path = temp_file.name
-                
-                # Create new stage with temporary file (ASCII format)
-                external_stage = Usd.Stage.CreateNew(temp_path)
-                
-                # Ensure ASCII format is set
-                layer = external_stage.GetRootLayer()
-                layer.fileFormat = 'usda'
-                
-                # Set up stage structure
-                UsdGeom.SetStageUpAxis(external_stage, UsdGeom.Tokens.z)
-                layer.defaultPrim = "Root"
-                
-                # Create root
-                root_prim = external_stage.DefinePrim("/Root", "Xform")
-                root_prim.SetMetadata("kind", "model")
-                external_stage.SetDefaultPrim(root_prim)
-                
-                # Create prototype container Xform
-                prototype_container = external_stage.DefinePrim("/Root/prototype", "Xform")
-                prototype_container.SetMetadata("kind", "component")
-                
-                # Copy prototype data with full details using unified method
-                # Copy to the prototype container, preserving the original name
-                # IMPORTANT: Set include_materials=False to prevent copying duplicate materials
-                prototype_name = external_prototype_data['prim'].GetName()
-                prototype_path = f"/Root/prototype/{prototype_name}"
-                self.copy_prim_data(external_prototype_data['prim'], external_stage, prototype_path, include_materials=False, include_children=True)
-                
-                # DO NOT copy materials to external file - they should only be in the main file
-                # This prevents namespace collisions and unused material warnings
-                # self._copy_materials_to_external_stage(external_stage, external_prototype_data['materials'])
-                
-                # CLEANUP: Remove any remaining materials from the external stage
-                self._remove_unused_materials_from_external_stage(external_stage)
-                
-                external_stage.Save()
+                # Suppress USD warnings during entire external file creation
+                with suppress_usd_warnings():
+                    # Create a temporary file to avoid USD layer caching issues
+                    with tempfile.NamedTemporaryFile(suffix=".usda", delete=False) as temp_file:
+                        temp_path = temp_file.name
+                    
+                    external_stage = Usd.Stage.CreateNew(temp_path)
+                    
+                    # Ensure ASCII format is set
+                    layer = external_stage.GetRootLayer()
+                    layer.fileFormat = 'usda'
+                    
+                    # Set up stage structure
+                    UsdGeom.SetStageUpAxis(external_stage, UsdGeom.Tokens.z)
+                    layer.defaultPrim = "Root"
+                    
+                    # Create root
+                    root_prim = external_stage.DefinePrim("/Root", "Xform")
+                    root_prim.SetMetadata("kind", "model")
+                    external_stage.SetDefaultPrim(root_prim)
+                    
+                    # Copy all materials to external file, then remove unused ones
+                    self._copy_materials_to_external_stage(external_stage, self.output_data['materials'], is_external=True)
+                    
+                    # Create prototype container Xform
+                    prototype_container = external_stage.DefinePrim("/Root/prototype", "Xform")
+                    prototype_container.SetMetadata("kind", "component")
+                    
+                    # Copy prototype data with materials enabled AND transform
+                    prototype_name = external_prototype_data['prim'].GetName()
+                    prototype_path = f"/Root/prototype/{prototype_name}"
+                    copied_prim = self.copy_prim_data(external_prototype_data['prim'], external_stage, prototype_path, include_materials=True, include_children=True)
+                    
+                    # Apply transform from original prototype if it exists
+                    if copied_prim and 'transform' in external_prototype_data:
+                        transform = external_prototype_data['transform']
+                        if transform and transform != Gf.Matrix4d(1.0):
+                            xformable = UsdGeom.Xformable(copied_prim)
+                            xformable.AddTransformOp().Set(transform)
+                            print(f"TRANSFORM Applied transform to external prototype {prototype_name}")
+                    
+                    # Face count already collected in data collector, stored in external_prototype_data
+                    if 'face_count' in external_prototype_data:
+                        self.prototype_face_counts[prototype_name] = external_prototype_data['face_count']
+                        print(f"FACES Loaded face count for external {prototype_name}: {external_prototype_data['face_count']} faces")
+                    
+                    # Remove unused materials (keep only materials bound to meshes in this file)
+                    self._remove_unused_materials_from_external_file(external_stage)
+                    
+                    # Fix texture paths for external file (add ../ prefix)
+                    self._fix_external_texture_paths(external_stage)
+                    
+                    # Apply final mesh fixes to external file
+                    self._apply_final_mesh_fixes(external_stage)
+                    
+                    external_stage.Save()
                 
                 # Move the temporary file to the final location
                 shutil.move(temp_path, external_file_path)
@@ -1041,7 +1323,13 @@ class FinalOutputGenerator:
         # Get the source PointInstancer
         source_instancer_prim = pointinstancer_data['prim']
         
-        # Use parent_path if available, otherwise fall back to path
+        # For Blender 4.5 with parent preservation, this should not be called
+        # The parent container is copied in _create_pointinstancers instead
+        if pointinstancer_data.get('preserve_parent'):
+            # This should not happen - parent is handled in _create_pointinstancers
+            print(f"WARNING: _create_existing_pointinstancer called for Blender 4.5 PointInstancer - should be handled in _create_pointinstancers")
+            return
+        
         parent_path = pointinstancer_data.get('parent_path', '/Root')
         instancer_name = pointinstancer_data['name']
         instancer_path = f"{parent_path}/{instancer_name}"
@@ -1080,10 +1368,6 @@ class FinalOutputGenerator:
             
             # Now recursively update only the material and texture paths in the copied structure
             self._update_material_texture_paths_recursive(copied_instancer, output_stage)
-            
-            # IMPORTANT: Apply interpolation fixes to the entire copied PointInstancer structure
-            # This ensures Remix compatibility by converting vertex to faceVarying interpolation for normals and texCoords
-            self._apply_interpolation_fixes_recursive(copied_instancer)
     
     def _update_material_texture_paths_recursive(self, prim, output_stage):
         """Recursively update material and texture paths in a prim and its children"""
@@ -1129,116 +1413,40 @@ class FinalOutputGenerator:
         for child in prim.GetAllChildren():
             self._update_material_texture_paths_recursive(child, output_stage)
 
-    def _apply_interpolation_fixes_recursive(self, prim):
-        """Recursively apply interpolation fixes to all mesh prims for Remix compatibility - convert vertex to faceVarying for normals and texCoords"""
-        try:
-            # Apply interpolation fixes to this prim if it's a mesh
-            if prim.IsA(UsdGeom.Mesh):
-                print(f"REMIX Applying interpolation fixes to mesh: {prim.GetPath()}")
-                self._apply_interpolation_fixes_to_mesh(prim)
-            
-            # Recursively process all children
-            for child in prim.GetAllChildren():
-                self._apply_interpolation_fixes_recursive(child)
-                
-        except Exception as e:
-            print(f"WARNING Failed to apply interpolation fixes to {prim.GetPath()}: {e}")
 
-    def _apply_interpolation_fixes_to_mesh(self, mesh_prim):
-        """Apply interpolation fixes to a single mesh prim for Remix compatibility"""
-        try:
-            # Skip interpolation conversion if mode is 'none'
-            if self.interpolation_mode == "none":
-                print(f"REMIX Skipping interpolation conversion for mesh: {mesh_prim.GetPath()}")
-                return
-            
-            # Fix ONLY normals and texCoord primvars based on selected mode
-            # Keep all other attributes unchanged
-            primvar_api = UsdGeom.PrimvarsAPI(mesh_prim)
-            if primvar_api:
-                # Get all primvars and fix interpolation for specific types only
-                for primvar in primvar_api.GetPrimvars():
-                    if primvar:
-                        current_interpolation = primvar.GetInterpolation()
-                        primvar_name = primvar.GetPrimvarName()
-                        
-                        # Apply conversion based on selected mode for texCoord primvars
-                        if self.interpolation_mode == "faceVarying" and current_interpolation == UsdGeom.Tokens.vertex:
-                            # Check if this is a texCoord primvar (st, uv, texCoord, etc.)
-                            if ("st" in primvar_name or "uv" in primvar_name.lower() or 
-                                "texcoord" in primvar_name.lower() or primvar_name.startswith("primvars:")):
-                                primvar.SetInterpolation(UsdGeom.Tokens.faceVarying)
-                                print(f"REMIX Fixed texCoord interpolation {current_interpolation}→faceVarying for primvar: {primvar_name}")
-                            else:
-                                print(f"REMIX Kept vertex interpolation for non-texCoord primvar: {primvar_name}")
-                        elif self.interpolation_mode == "vertex" and current_interpolation == UsdGeom.Tokens.faceVarying:
-                            # Check if this is a texCoord primvar (st, uv, texCoord, etc.)
-                            if ("st" in primvar_name or "uv" in primvar_name.lower() or 
-                                "texcoord" in primvar_name.lower() or primvar_name.startswith("primvars:")):
-                                primvar.SetInterpolation(UsdGeom.Tokens.vertex)
-                                print(f"REMIX Fixed texCoord interpolation {current_interpolation}→vertex for primvar: {primvar_name}")
-                            else:
-                                print(f"REMIX Kept faceVarying interpolation for non-texCoord primvar: {primvar_name}")
-                        else:
-                            print(f"REMIX Kept {current_interpolation} interpolation for primvar: {primvar_name}")
-            
-            # Fix direct attributes that have interpolation modes (like normals)
-            mesh = UsdGeom.Mesh(mesh_prim)
-            if mesh:
-                # Check and fix normals interpolation based on selected mode
-                normals_attr = mesh.GetNormalsAttr()
-                if normals_attr and normals_attr.HasValue():
-                    try:
-                        current_normals_interpolation = mesh.GetNormalsInterpolation()
-                        if self.interpolation_mode == "faceVarying" and current_normals_interpolation == UsdGeom.Tokens.vertex:
-                            # Convert vertex to faceVarying
-                            mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
-                            print(f"REMIX Fixed normals interpolation {current_normals_interpolation}→faceVarying for mesh: {mesh_prim.GetPath()}")
-                        elif self.interpolation_mode == "vertex" and current_normals_interpolation == UsdGeom.Tokens.faceVarying:
-                            # Convert faceVarying to vertex
-                            mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
-                            print(f"REMIX Fixed normals interpolation {current_normals_interpolation}→vertex for mesh: {mesh_prim.GetPath()}")
-                        else:
-                            print(f"REMIX Kept normals interpolation {current_normals_interpolation} for mesh: {mesh_prim.GetPath()}")
-                    except Exception as e:
-                        print(f"WARNING Could not fix normals interpolation: {e}")
-            
-            # Also ensure float2 primvars are converted to texCoord2f for Remix compatibility
-            stage = mesh_prim.GetStage()
-            self._convert_float2_primvars_in_stage(stage)
-            
-        except Exception as e:
-            print(f"WARNING Failed to apply interpolation fixes to mesh {mesh_prim.GetPath()}: {e}")
 
     def _convert_textures_direct(self):
         """Convert only textures that are actually referenced in materials - NO WASTEFUL COPYING!"""
+        # Initialize texture details tracking
+        self._texture_details = []
+        
         if not self.texture_converter or not self.texture_converter.nvtt_compress_path:
-            print("⚠️  Texture conversion skipped - NVIDIA Texture Tools not available")
+            print("  Texture conversion skipped - NVIDIA Texture Tools not available")
             return 0
         
-        print("🎨 Converting textures with NVIDIA Texture Tools...")
+        print(" Converting textures with NVIDIA Texture Tools...")
         
         # Find source textures directory from input
         if not self.input_stage:
-            print("⚠️  No input stage available for texture conversion")
+            print("  No input stage available for texture conversion")
             return 0
             
         try:
             root_layer = self.input_stage.GetRootLayer()
             input_identifier = getattr(root_layer, 'realPath', None) or getattr(root_layer, 'identifier', None)
             if not input_identifier:
-                print("⚠️  Could not determine input file location")
+                print("  Could not determine input file location")
                 return 0
 
             input_dir = os.path.dirname(input_identifier)
             source_textures_dir = os.path.join(input_dir, 'textures')
             
             if not os.path.exists(source_textures_dir):
-                print(f"⚠️  Source textures directory not found: {source_textures_dir}")
+                print(f"  Source textures directory not found: {source_textures_dir}")
                 return 0
                 
         except Exception as e:
-            print(f"⚠️  Error finding source textures directory: {e}")
+            print(f"  Error finding source textures directory: {e}")
             return 0
         
         # Create output textures directory
@@ -1250,12 +1458,12 @@ class FinalOutputGenerator:
         referenced_textures = self._collect_referenced_textures()
         
         if not referenced_textures:
-            print("⚠️  No texture references found in materials - skipping conversion")
+            print("  No texture references found in materials - skipping conversion")
             return 0
         
-        print(f"🔍 Found {len(referenced_textures)} texture references in materials")
-        print(f"📁 Converting textures from: {source_textures_dir}")
-        print(f"📁 Output directory: {target_textures_dir}")
+        print(f" Found {len(referenced_textures)} texture references in materials")
+        print(f" Converting textures from: {os.path.normpath(source_textures_dir)}")
+        print(f" Output directory: {os.path.normpath(target_textures_dir)}")
         
         # Convert only referenced textures directly from source
         results = self._convert_referenced_textures_only(
@@ -1272,36 +1480,155 @@ class FinalOutputGenerator:
         
         return successful_conversions
     
-    def _convert_textures(self):
-        """DEPRECATED: Use _convert_textures_direct() instead"""
-        print("⚠️  _convert_textures() is deprecated - using direct conversion instead")
-        return self._convert_textures_direct()
-    
-    def _collect_referenced_textures(self):
-        """Collect all texture paths referenced in materials"""
-        referenced_textures = set()
+    def _build_texture_material_context(self):
+        """Build mapping of texture paths to their material context (type and opacity pairing)"""
+        texture_context = {}
         
         try:
-            # Open the output stage to scan for texture references
-            stage = Usd.Stage.Open(self.output_path)
+            for material_name, material_info in self.output_data['materials'].items():
+                if not material_info.get('is_remix'):
+                    continue
+                
+                remix_params = material_info.get('remix_params', {})
+                
+                # Check for opacity combination flag
+                needs_opacity_combine = remix_params.get('_combine_opacity_with_diffuse', False)
+                opacity_texture_path = remix_params.get('_opacity_texture_path')
+                
+                # Map each texture parameter to its type and opacity pairing
+                for param_name, param_value in remix_params.items():
+                    if param_name.startswith('_') or not param_name.endswith('_texture'):
+                        continue
+                    
+                    if not isinstance(param_value, str):
+                        continue
+                    
+                    # Extract texture path from texture_2d() format or plain path
+                    import re
+                    match = re.search(r'texture_2d\("([^"]+)"', param_value)
+                    if match:
+                        texture_path = match.group(1)
+                    else:
+                        texture_path = param_value.strip('@')
+                    
+                    if not texture_path:
+                        continue
+                    
+                    # Determine texture type from parameter name
+                    if param_name == 'diffuse_texture':
+                        texture_type = 'diffuse'
+                        # If this material needs opacity combination, store the opacity texture path
+                        if needs_opacity_combine and opacity_texture_path:
+                            texture_context[texture_path] = ('diffuse', opacity_texture_path)
+                        else:
+                            texture_context[texture_path] = ('diffuse', None)
+                    elif param_name == 'normalmap_texture':
+                        texture_context[texture_path] = ('normal', None)
+                    elif param_name == 'reflectionroughness_texture':
+                        texture_context[texture_path] = ('roughness', None)
+                    elif param_name == 'metallic_texture':
+                        texture_context[texture_path] = ('metallic', None)
+                    elif param_name == 'emissive_mask_texture':
+                        texture_context[texture_path] = ('emissive', None)
+                    else:
+                        texture_context[texture_path] = (None, None)
+        
+        except Exception as e:
+            print(f" Error building texture material context: {e}")
+        
+        return texture_context
+    
+    def _collect_referenced_textures(self):
+        """Collect all texture paths referenced in materials with source path mapping"""
+        referenced_textures = {}  # Maps output_path -> source_path
+        
+        try:
+            print(f"DEBUG Collecting textures from {len(self.output_data.get('materials', {}))} materials")
+            # Collect from converted materials with source path mapping
+            for material_name, material_info in self.output_data.get('materials', {}).items():
+                print(f"DEBUG Material: {material_name}, is_remix: {material_info.get('is_remix')}")
+                if material_info.get('is_remix'):
+                    remix_params = material_info.get('remix_params', {})
+                    print(f"DEBUG   Remix params: {list(remix_params.keys())}")
+                    for param_name, param_value in remix_params.items():
+                        if param_name.endswith('_texture') and isinstance(param_value, str):
+                            print(f"DEBUG   Found texture param: {param_name} = {param_value}")
+                            # Extract output path from texture_2d("path", gamma) format
+                            output_path = None
+                            if 'texture_2d(' in param_value:
+                                import re
+                                match = re.search(r'texture_2d\("([^"]+)"', param_value)
+                                if match:
+                                    output_path = match.group(1)
+                            else:
+                                output_path = param_value.strip('@')
+                            
+                            print(f"DEBUG   Extracted output_path: {output_path}")
+                            
+                            if output_path and not output_path.startswith('@'):
+                                # Check for texture bending flags first (roughness from diffuse/specular)
+                                source_path = None
+                                if param_name == 'reflectionroughness_texture':
+                                    # Check for texture bending: invert_for_roughness or use_diffuse_for_roughness
+                                    if remix_params.get('_invert_for_roughness'):
+                                        # Use diffuse or specular source with inversion
+                                        source_path = remix_params.get('_diffuse_source') or remix_params.get('_specular_source')
+                                        print(f"DEBUG   Roughness with inversion, using source: {source_path}")
+                                    elif remix_params.get('_use_diffuse_for_roughness'):
+                                        # Use diffuse source without inversion
+                                        source_path = remix_params.get('_diffuse_source')
+                                        print(f"DEBUG   Roughness from diffuse, using source: {source_path}")
+                                
+                                # If no texture bending, check for standard _source path
+                                if not source_path:
+                                    source_param = f"_{param_name}_source"
+                                    source_path = remix_params.get(source_param)
+                                    print(f"DEBUG   Looking for source param: {source_param}, found: {source_path}")
+                                
+                                if source_path:
+                                    referenced_textures[output_path] = source_path
+                                    print(f"DEBUG   Added texture: {output_path} <- {source_path}")
+                                else:
+                                    # No source path, use output path as source
+                                    referenced_textures[output_path] = output_path
+                                    print(f"DEBUG   Added texture (no source): {output_path}")
             
-            # Traverse all prims looking for materials and their texture inputs
-            for prim in stage.TraverseAll():
-                if prim.IsA(UsdShade.Material):
-                    material = UsdShade.Material(prim)
-                    self._collect_textures_from_material(material, referenced_textures)
-                elif prim.GetName() == "Shader" and prim.GetParent().IsA(UsdShade.Material):
-                    # Handle RTX Remix "over Shader" patterns directly
-                    self._collect_textures_from_shader_prim(prim, referenced_textures)
-            
-            print(f"📋 Collected {len(referenced_textures)} unique texture references:")
-            for texture_path in sorted(referenced_textures):
-                print(f"    📄 {texture_path}")
+            print(f" Collected {len(referenced_textures)} unique texture references:")
+            for output_path, source_path in sorted(referenced_textures.items()):
+                if output_path != source_path:
+                    print(f"     {output_path} <- {source_path}")
+                else:
+                    print(f"     {output_path}")
                 
         except Exception as e:
-            print(f"❌ Error collecting texture references: {e}")
+            print(f" Error collecting texture references: {e}")
+            import traceback
+            print(f" Traceback: {traceback.format_exc()}")
             
         return referenced_textures
+    
+    def _parse_mdl_for_textures(self, mdl_path, referenced_textures, mdl_dir):
+        """Parse MDL file to extract texture_2d() references"""
+        try:
+            omnipbr_params = parse_omnipbr_mdl(mdl_path)
+            if omnipbr_params:
+                for param_name, param_value in omnipbr_params.items():
+                    if isinstance(param_value, str) and 'texture_2d(' in param_value:
+                        import re
+                        match = re.search(r'texture_2d\("([^"]+)"', param_value)
+                        if match:
+                            texture_path = match.group(1)
+                            if texture_path and any(ext in texture_path.lower() for ext in ['.png', '.jpg', '.jpeg', '.tga', '.bmp']):
+                                # Resolve relative paths from MDL directory
+                                if texture_path.startswith('./'):
+                                    resolved_path = os.path.join(mdl_dir, texture_path[2:])
+                                    resolved_path = os.path.normpath(resolved_path).replace('\\', '/')
+                                    texture_path = resolved_path
+                                if texture_path not in referenced_textures:
+                                    print(f"     Found texture in MDL: {texture_path}")
+                                referenced_textures.add(texture_path)
+        except Exception as e:
+            print(f"  Warning: Could not parse MDL file {mdl_path}: {e}")
     
     def _collect_textures_from_material(self, material, referenced_textures):
         """Collect texture references from a material"""
@@ -1320,7 +1647,7 @@ class FinalOutputGenerator:
                     self._collect_textures_from_shader_prim(child, referenced_textures)
                     
         except Exception as e:
-            print(f"⚠️  Error collecting textures from material {material.GetPath()}: {e}")
+            print(f"  Error collecting textures from material {material.GetPath()}: {e}")
     
     def _collect_textures_from_shader(self, shader, referenced_textures):
         """Collect texture references from a shader (deprecated - use _collect_textures_from_shader_prim)"""
@@ -1328,7 +1655,7 @@ class FinalOutputGenerator:
             shader_prim = shader.GetPrim()
             self._collect_textures_from_shader_prim(shader_prim, referenced_textures)
         except Exception as e:
-            print(f"⚠️  Error collecting textures from shader {shader.GetPath()}: {e}")
+            print(f"  Error collecting textures from shader {shader.GetPath()}: {e}")
     
     def _collect_textures_from_shader_prim(self, shader_prim, referenced_textures):
         """Collect texture references from a shader prim"""
@@ -1350,184 +1677,237 @@ class FinalOutputGenerator:
                             clean_path = asset_path_str.strip('@')
                             # Only log if this is a new texture reference
                             if clean_path not in referenced_textures:
-                                print(f"    🎨 Found texture reference: {clean_path}")
+                                print(f"     Found texture reference: {clean_path}")
                             referenced_textures.add(clean_path)
                             
         except Exception as e:
-            print(f"⚠️  Error collecting textures from shader prim {shader_prim.GetPath()}: {e}")
+            print(f"  Error collecting textures from shader prim {shader_prim.GetPath()}: {e}")
     
     def _convert_referenced_textures_only(self, referenced_textures, source_textures_dir, output_dir):
-        """Convert only textures that are actually referenced"""
+        """Convert only textures that are actually referenced
+        
+        Args:
+            referenced_textures: Dict mapping output_path -> source_path
+            source_textures_dir: Directory to search for source textures (fallback)
+            output_dir: Directory for output DDS files
+        """
         results = {}
         successful_count = 0
         failed_count = 0
         missing_count = 0
         
-        # First pass: create mapping of source files to all their references
-        source_file_to_refs = {}
+        # Build material context map: texture_path -> (texture_type, opacity_texture_path)
+        texture_material_context = self._build_texture_material_context()
         
-        for texture_ref in referenced_textures:
-            # Handle different path formats
-            if texture_ref.startswith('./textures/'):
-                # Relative path from USD file
-                texture_filename = texture_ref[11:]  # Remove './textures/'
-            elif texture_ref.startswith('./'):
-                # Other relative path
-                texture_filename = os.path.basename(texture_ref)
-            else:
-                # Direct filename or absolute path
-                texture_filename = os.path.basename(texture_ref)
+        # Collect opacity texture paths to skip conversion
+        opacity_textures_to_skip = set()
+        for texture_path, (texture_type, opacity_path) in texture_material_context.items():
+            if opacity_path:
+                opacity_textures_to_skip.add(opacity_path)
+        
+        # Process each texture reference individually to create deduplicated DDS files
+        for texture_ref, source_path in referenced_textures.items():
+            # Skip opacity textures - they're combined into diffuse alpha channel
+            if texture_ref in opacity_textures_to_skip:
+                print(f" Skipping opacity texture (combined into diffuse): {texture_ref}")
+                continue
             
-            # Look for the source texture file in the source directory
-            source_file = os.path.join(source_textures_dir, texture_filename)
+            # Get texture type from material context (NOT from filename)
+            slot_type = None
+            if texture_ref in texture_material_context:
+                slot_type, _ = texture_material_context[texture_ref]
             
-            # Check different extensions for source file
-            source_extensions = ['.png', '.jpg', '.jpeg', '.tga', '.bmp', '.tiff']
+            # Default to diffuse if no type found
+            if not slot_type:
+                slot_type = 'diffuse'
+            
+            # Resolve source_path
             actual_source_file = None
             
-            # If it already has DDS extension, check if source exists with other extensions
-            if texture_filename.lower().endswith('.dds'):
-                base_name = texture_filename[:-4]  # Remove .dds
-                for ext in source_extensions:
-                    candidate = os.path.join(source_textures_dir, base_name + ext)
-                    if os.path.exists(candidate):
-                        actual_source_file = candidate
-                        break
+            if source_path.startswith('./'):
+                # Relative path like ./textures/bush.jpg - resolve relative to source_textures_dir
+                source_filename = source_path.replace('./textures/', '')
+                actual_source_file = os.path.join(source_textures_dir, source_filename)
+            elif os.path.isabs(source_path):
+                # Absolute path - use as-is (from OmniPBR MDL resolution)
+                actual_source_file = source_path
             else:
-                # Direct file check
-                if os.path.exists(source_file):
-                    actual_source_file = source_file
-                else:
-                    # Try different extensions for the base name
-                    base_name = os.path.splitext(texture_filename)[0]
-                    for ext in source_extensions:
-                        candidate = os.path.join(source_textures_dir, base_name + ext)
-                        if os.path.exists(candidate):
-                            actual_source_file = candidate
-                            break
+                # Relative path without ./ prefix (from OmniPBR MDL resolution)
+                # These are relative to the input file directory, not source_textures_dir
+                input_dir = os.path.dirname(os.path.dirname(source_textures_dir))  # Go up from textures to input dir
+                actual_source_file = os.path.join(input_dir, source_path)
             
-            if actual_source_file:
-                if actual_source_file not in source_file_to_refs:
-                    source_file_to_refs[actual_source_file] = []
-                source_file_to_refs[actual_source_file].append(texture_ref)
-            else:
-                # Handle missing files immediately
+            if not actual_source_file:
+                # Handle missing files
                 missing_count += 1
-                print(f"⚠️  Referenced texture not found: {texture_ref}")
-                print(f"    Looked for: {texture_filename} in {source_textures_dir}")
-                
+                print(f"  Referenced texture not found: {texture_ref}")
+                print(f"    Source path: {source_path}")
                 results[texture_ref] = {
                     'success': False,
                     'output': None,
                     'referenced_path': texture_ref,
                     'missing': True
                 }
-        
-        print(f"🔍 Found {len(source_file_to_refs)} unique source textures for {len(referenced_textures)} references")
-        
-        # Print detailed mapping for debugging
-        for source_file, refs in source_file_to_refs.items():
-            filename = os.path.basename(source_file)
-            if len(refs) > 1:
-                print(f"📋 {filename} has {len(refs)} references: {refs}")
-            else:
-                print(f"📄 {filename} has 1 reference: {refs[0]}")
-        
-        # Second pass: convert each unique source file only once
-        for actual_source_file, texture_refs in source_file_to_refs.items():
-            texture_filename = os.path.basename(actual_source_file)
-            output_filename = os.path.splitext(texture_filename)[0] + '.dds'
+                continue
+            
+            # Determine output filename - must match the reference path exactly
+            # Extract the expected output filename from the reference
+            output_filename = os.path.basename(texture_ref.replace('./textures/', ''))
+            if not output_filename.endswith('.dds'):
+                output_filename = os.path.splitext(output_filename)[0] + '.dds'
             output_file = os.path.join(output_dir, output_filename)
             
-            # Show how many references point to this file
-            if len(texture_refs) > 1:
-                print(f"📋 Processing texture: {texture_filename} (referenced {len(texture_refs)} times)")
-            
-            # Check if this texture was already processed in this session
-            if actual_source_file in self.texture_conversion_cache:
-                cached_output = self.texture_conversion_cache[actual_source_file]
-                print(f"📋 Using cached conversion: {os.path.basename(actual_source_file)} → {os.path.basename(cached_output)}")
+            print(f" Processing: {texture_ref} -> {output_filename} (slot: {slot_type})")
+            # Check if this specific output file was already created
+            cache_key = (actual_source_file, slot_type)
+            if cache_key in self.texture_conversion_cache:
+                cached_output = self.texture_conversion_cache[cache_key]
+                print(f" Using cached: {output_filename}")
                 successful_count += 1
-                # Update results for all references to this file
-                for texture_ref in texture_refs:
-                    results[texture_ref] = {
-                        'success': True,
-                        'output': cached_output,
-                        'referenced_path': texture_ref
-                    }
+                
+                # Track cached texture for UI display
+                if slot_type == 'diffuse':
+                    detail = f"CACHED: {output_filename}"
+                else:
+                    detail = f"CACHED: {output_filename} (slot: {slot_type})"
+                self._texture_details.append(detail)
+                
+                results[texture_ref] = {
+                    'success': True,
+                    'output': cached_output,
+                    'referenced_path': texture_ref
+                }
                 continue
             
-            # Check if this texture is currently being converted
-            if actual_source_file in self.textures_being_converted:
-                print(f"⏳ Texture already being converted, skipping: {os.path.basename(actual_source_file)}")
-                continue
-            
-            # Check if DDS file already exists and is valid (non-zero size)
+            # Check if DDS file already exists
             if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
-                print(f"⏭️  Using existing DDS file: {output_filename}")
+                print(f" Using existing: {output_filename}")
                 successful_count += 1
-                # Cache this result for future reference
-                self.texture_conversion_cache[actual_source_file] = output_file
-                # Update results for all references to this file
-                for texture_ref in texture_refs:
-                    results[texture_ref] = {
-                        'success': True,
-                        'output': output_file,
-                        'referenced_path': texture_ref
-                    }
+                self.texture_conversion_cache[cache_key] = output_file
+                
+                # Track skipped texture for UI display
+                if slot_type == 'diffuse':
+                    detail = f"SKIPPED: {output_filename} (already exists)"
+                else:
+                    detail = f"SKIPPED: {output_filename} (already exists, slot: {slot_type})"
+                self._texture_details.append(detail)
+                
+                results[texture_ref] = {
+                    'success': True,
+                    'output': output_file,
+                    'referenced_path': texture_ref
+                }
                 continue
             
-            # Mark texture as being converted
-            self.textures_being_converted.add(actual_source_file)
+            print(f" Converting: {os.path.basename(actual_source_file)} -> {output_filename}")
             
-            print(f"🔄 Converting referenced texture: {os.path.basename(actual_source_file)} → {output_filename}")
-            print(f"    📁 Source: {actual_source_file}")
-            print(f"    📁 Target: {output_file}")
-            print(f"    🔍 Source exists: {os.path.exists(actual_source_file)}")
-            print(f"    📊 Source size: {os.path.getsize(actual_source_file) if os.path.exists(actual_source_file) else 0} bytes")
-            print(f"    ⏱️  Starting conversion at: {time.time()}")
+            # Use slot type to determine texture type
+            texture_type = slot_type
+            opacity_texture_path = None
+            needs_inversion = False
+            is_bump_to_normal = False
             
-            start_time = time.time()
-            try:
-                # Use optimized settings for better performance
-                # - 'normal' quality instead of 'highest' for speed
-                # - GPU acceleration should handle this efficiently
-                success = self.texture_converter.convert_texture(
-                    actual_source_file,
-                    output_file,
-                    format='dds',
-                    quality='normal'  # Changed from 'highest' to 'normal' for performance
-                )
-            finally:
-                # Remove from being converted set regardless of success/failure
-                self.textures_being_converted.discard(actual_source_file)
-                end_time = time.time()
-                conversion_time = end_time - start_time
-                print(f"    ⏱️  Conversion took: {conversion_time:.2f} seconds")
+            # Get source texture and conversion flags from material mapping
+            source_texture_override = None
+            resolved_opacity_path = None
+            
+            for mat_name, mat_info in self.output_data.get('materials', {}).items():
+                if 'remix_params' in mat_info:
+                    remix_params = mat_info['remix_params']
+                    
+                    # Check for roughness texture with inversion flag (specular-to-roughness)
+                    if slot_type in ['roughness', 'rough'] and remix_params.get('_invert_for_roughness'):
+                        # Check if using diffuse source (specular same as diffuse) or specular source
+                        diffuse_src = remix_params.get('_diffuse_source')
+                        specular_src = remix_params.get('_specular_source')
+                        
+                        if diffuse_src:
+                            # Specular is same as diffuse - use diffuse source with inversion
+                            source_texture_override = diffuse_src.strip('@').replace('./textures/', '')
+                            if not os.path.isabs(source_texture_override):
+                                source_texture_override = os.path.join(source_textures_dir, source_texture_override)
+                            needs_inversion = True
+                            break
+                        elif specular_src:
+                            # Specular has its own texture - use specular source with inversion
+                            source_texture_override = specular_src.strip('@').replace('./textures/', '')
+                            if not os.path.isabs(source_texture_override):
+                                source_texture_override = os.path.join(source_textures_dir, source_texture_override)
+                            needs_inversion = True
+                            break
+                    
+                    # Check for diffuse-to-roughness flag (grayscale only, no inversion)
+                    if slot_type in ['roughness', 'rough'] and remix_params.get('_use_diffuse_for_roughness'):
+                        # Use DIFFUSE texture source for roughness conversion (grayscale only)
+                        diffuse_src = remix_params.get('_diffuse_source')
+                        if diffuse_src:
+                            source_texture_override = diffuse_src.strip('@').replace('./textures/', '')
+                            if not os.path.isabs(source_texture_override):
+                                source_texture_override = os.path.join(source_textures_dir, source_texture_override)
+                            needs_inversion = False  # No inversion for diffuse-to-roughness
+                            break
+                    
+                    # Check for opacity texture pairing
+                    if texture_ref in texture_material_context:
+                        _, opacity_texture_path = texture_material_context[texture_ref]
+                        if opacity_texture_path:
+                            opacity_src = remix_params.get('_opacity_texture_source', opacity_texture_path)
+                            resolved_opacity_path = opacity_src.strip('@').replace('./textures/', '')
+                            if not os.path.isabs(resolved_opacity_path):
+                                resolved_opacity_path = os.path.join(source_textures_dir, resolved_opacity_path)
+            
+            # Convert texture with proper slot-specific settings
+            success = self.texture_converter.convert_texture(
+                actual_source_file,
+                output_file,
+                force_type=texture_type,
+                format='dds',
+                quality='normal',
+                opacity_texture_path=resolved_opacity_path,
+                is_bump_to_normal=is_bump_to_normal,
+                source_texture_override=source_texture_override,
+                needs_inversion=needs_inversion
+            )
             
             if success:
                 successful_count += 1
-                print(f"    ✅ Successfully converted: {output_filename}")
-                # Cache successful conversion for future reference
-                self.texture_conversion_cache[actual_source_file] = output_file
+                print(f" [OK] Created: {output_filename}")
+                self.texture_conversion_cache[cache_key] = output_file
+                
+                # Track texture details for UI display
+                if slot_type == 'diffuse':
+                    detail = f"{os.path.basename(actual_source_file)} ??{output_filename}"
+                else:
+                    # Show auto-generation for non-diffuse slots
+                    detail = f"{os.path.basename(actual_source_file)} ??{slot_type} ??{output_filename}"
+                self._texture_details.append(detail)
             else:
                 failed_count += 1
-                print(f"    ❌ Failed to convert: {os.path.basename(actual_source_file)}")
+                print(f" [FAIL] Failed: {output_filename}")
+                print(f"    DEBUG Source: {actual_source_file}")
+                print(f"    DEBUG Slot type: {slot_type}")
+                self._texture_details.append(f"FAILED: {output_filename} (conversion failed)")
+                
+                # Track failed conversion details for summary
+                fail_reason = "texture not found" if not os.path.exists(actual_source_file) else "conversion failed"
+                self.failed_texture_conversions.append({
+                    'source': actual_source_file,
+                    'slot_type': slot_type,
+                    'reason': fail_reason
+                })
             
-            # Update results for all references to this file
-            for texture_ref in texture_refs:
-                results[texture_ref] = {
-                    'success': success,
-                    'output': output_file if success else None,
-                    'referenced_path': texture_ref
-                }
+            results[texture_ref] = {
+                'success': success,
+                'output': output_file if success else None,
+                'referenced_path': texture_ref
+            }
         
         # Print summary
-        print(f"\n📊 Texture Conversion Summary:")
-        print(f"   ✅ Successfully converted: {successful_count}")
-        print(f"   ❌ Failed conversions: {failed_count}")
-        print(f"   📵 Missing source files: {missing_count}")
-        print(f"   📁 Output directory: {output_dir}")
+        print(f"\n Texture Conversion Summary:")
+        print(f"    Successfully converted: {successful_count}")
+        print(f"    Failed conversions: {failed_count}")
+        print(f"    Missing source files: {missing_count}")
+        print(f"    Output directory: {os.path.normpath(output_dir)}")
         
         return results
     
@@ -1560,7 +1940,7 @@ class FinalOutputGenerator:
                                     
                                     # Update the path
                                     attr.Set(Sdf.AssetPath(new_path))
-                                    print(f"    ✅ Updated texture reference: {current_path_str} → {new_path}")
+                                    print(f"     Updated texture reference: {current_path_str} ??{new_path}")
                                     updated_any = True
                                     successful_conversions += 1
                 
@@ -1575,16 +1955,16 @@ class FinalOutputGenerator:
                                 texture_name = os.path.splitext(os.path.basename(value_str))[0]
                                 new_path = f"./textures/{texture_name}.dds"
                                 attr.Set(Sdf.AssetPath(new_path))
-                                print(f"    ✅ Updated texture reference: {value_str} → {new_path}")
+                                print(f"     Updated texture reference: {value_str} ??{new_path}")
                                 updated_any = True
                                 successful_conversions += 1
             
             if updated_any:
                 stage.Save()
-                print(f"💾 Updated USD file with {successful_conversions} DDS texture references")
+                print(f" Updated USD file with {successful_conversions} DDS texture references")
             
         except Exception as e:
-            print(f"❌ Error updating texture references: {e}")
+            print(f" Error updating texture references: {e}")
         
         return successful_conversions
     
@@ -1670,80 +2050,32 @@ class FinalOutputGenerator:
         except Exception as e:
             print(f"WARNING Failed to copy geometry comprehensively: {e}")
     
-    def _cleanup_unused_materials(self, output_stage):
-        """Remove unused materials to prevent clutter and conflicts"""
-        try:
-            # Get all materials in output
-            output_materials = []
-            for prim in output_stage.TraverseAll():
-                if prim.IsA(UsdShade.Material):
-                    output_materials.append(prim)
-            
-            # Get all material bindings
-            used_materials = set()
-            for prim in output_stage.TraverseAll():
-                if prim.IsA(UsdGeom.Mesh):
-                    material_binding_api = UsdShade.MaterialBindingAPI(prim)
-                    if material_binding_api:
-                        binding_rel = material_binding_api.GetDirectBindingRel()
-                        if binding_rel:
-                            targets = binding_rel.GetTargets()
-                            if targets:
-                                used_materials.add(str(targets[0]))
-            
-            # Remove unused materials
-            removed_count = 0
-            for material in output_materials:
-                material_path = str(material.GetPath())
-                if material_path not in used_materials:
-                    try:
-                        output_stage.RemovePrim(material.GetPath())
-                        removed_count += 1
-                    except Exception as e:
-                        print(f"WARNING Could not remove unused material {material_path}: {e}")
-            
-            pass
-                
-        except Exception as e:
-            print(f"WARNING Failed to cleanup unused materials: {e}")
-    
     def _remove_old_blender_materials_from_prototype(self, prototype_prim):
         """Remove old Blender material scopes from prototypes since we now have RTX Remix materials in /Root/Looks"""
         try:
-            print(f"CLEANUP Scanning prototype for old Blender materials: {prototype_prim.GetPath()}")
             materials_to_remove = []
             
-            # Traverse all descendants to find _materials scopes
             for prim in prototype_prim.GetStage().Traverse():
-                # Check if this prim is under our prototype path
                 if not str(prim.GetPath()).startswith(str(prototype_prim.GetPath())):
                     continue
                     
                 if prim.GetTypeName() == "Scope" and prim.GetName() == "_materials":
-                    print(f"CLEANUP Found _materials scope: {prim.GetPath()}")
-                    # Check if this scope contains Blender materials (Principled_BSDF shaders)
                     has_blender_materials = False
                     for material_child in prim.GetStage().Traverse():
                         if str(material_child.GetPath()).startswith(str(prim.GetPath())):
                             if material_child.GetTypeName() == "Shader" and "Principled_BSDF" in material_child.GetName():
-                                print(f"CLEANUP Found Blender shader: {material_child.GetPath()}")
                                 has_blender_materials = True
                                 break
                     
                     if has_blender_materials:
                         materials_to_remove.append(prim.GetPath())
-                        print(f"CLEANUP Marking for removal: {prim.GetPath()}")
             
-            # Remove the old materials scopes
             for material_scope_path in materials_to_remove:
                 try:
                     prototype_prim.GetStage().RemovePrim(material_scope_path)
-                    print(f"CLEANUP Successfully removed old Blender materials scope: {material_scope_path}")
+                    self.materials_cleaned += 1
                 except Exception as e:
                     print(f"WARNING Could not remove old materials scope {material_scope_path}: {e}")
-                    
-            if not materials_to_remove:
-                print(f"CLEANUP No old Blender materials found in prototype: {prototype_prim.GetPath()}")
                     
         except Exception as e:
             print(f"WARNING Failed to remove old Blender materials from prototype: {e}")
@@ -1812,6 +2144,35 @@ class FinalOutputGenerator:
         except Exception:
             return False
     
+    def _remove_unused_materials_from_external_file(self, external_stage):
+        """Remove materials from external file that are not bound to any mesh in this file"""
+        try:
+            # Find all materials in /Root/Looks/
+            all_materials = set()
+            for prim in external_stage.TraverseAll():
+                if prim.IsA(UsdShade.Material) and str(prim.GetPath()).startswith("/Root/Looks/"):
+                    all_materials.add(str(prim.GetPath()))
+            
+            # Find materials actually used by meshes/GeomSubsets in this file
+            used_materials = set()
+            for prim in external_stage.TraverseAll():
+                mat_binding_rel = prim.GetRelationship('material:binding')
+                if mat_binding_rel:
+                    targets = mat_binding_rel.GetTargets()
+                    for target in targets:
+                        used_materials.add(str(target))
+            
+            # Remove unused materials
+            unused_materials = all_materials - used_materials
+            for material_path in unused_materials:
+                external_stage.RemovePrim(material_path)
+            
+            if unused_materials:
+                print(f"CLEANUP Removed {len(unused_materials)} unused materials from external file (kept {len(used_materials)})")
+                
+        except Exception as e:
+            print(f"WARNING Failed to cleanup unused materials from external file: {e}")
+    
     def _remove_unused_materials_from_external_stage(self, external_stage):
         """Remove unused materials from external stage - keep only /Root/Looks/ materials"""
         try:
@@ -1835,7 +2196,7 @@ class FinalOutputGenerator:
                 
                 # Also remove the entire /Root/Looks scope if it exists
                 elif (prim.GetName() == "Looks" and 
-                      prim_path_str == "/Root/Looks"):
+                    prim_path_str == "/Root/Looks"):
                     
                     materials_to_remove.append(prim.GetPath())
                     print(f"CLEANUP Found entire Looks scope to remove: {prim_path_str}")
@@ -1860,57 +2221,57 @@ class FinalOutputGenerator:
             print(f"Details: {traceback.format_exc()}")
 
     def _remove_unused_materials_from_main_file(self, main_stage):
-        """Remove unused materials from main file when using external references"""
+        """Remove materials NOT bound to any mesh in main file (external files have their own materials)"""
         try:
-            print("CLEANUP Removing unused materials from main file with external references...")
-            
-            materials_removed = 0
-            materials_to_remove = []
-            
-            # Find all material-containing scopes that are NOT in /Root/Looks/
+            # Find ALL materials bound in main file (excluding PointInstancer prototypes)
+            bound_materials = set()
             for prim in main_stage.TraverseAll():
-                prim_path_str = str(prim.GetPath())
+                # Skip prims inside PointInstancers (they reference external files)
+                parent = prim.GetParent()
+                is_in_pointinstancer = False
+                while parent:
+                    if parent.IsA(UsdGeom.PointInstancer):
+                        is_in_pointinstancer = True
+                        break
+                    parent = parent.GetParent()
                 
-                # Look for Looks scopes inside external reference prims (like /Root/mesh_001/Wild_Grass_1_002/Looks/)
-                if (prim.GetName() == "Looks" and 
-                    prim_path_str != "/Root/Looks" and
-                    "/Root/" in prim_path_str and
-                    len(prim_path_str.split("/")) > 3):  # More than just /Root/Looks
-                    
-                    # This is a duplicate materials scope from external reference - mark for removal
-                    materials_to_remove.append(prim.GetPath())
-                    print(f"CLEANUP Found unused materials scope in main file: {prim_path_str}")
-                
-                # Also look for individual materials outside /Root/Looks/ in external reference structure
-                elif (prim.IsA(UsdShade.Material) and 
-                      not prim_path_str.startswith("/Root/Looks/") and
-                      "/Root/" in prim_path_str and
-                      len(prim_path_str.split("/")) > 3):  # Avoid removing root-level materials
-                    
-                    materials_to_remove.append(prim.GetPath())
-                    print(f"CLEANUP Found unused material in main file: {prim_path_str}")
+                # Only check material bindings OUTSIDE PointInstancers
+                if not is_in_pointinstancer:
+                    mat_binding_rel = prim.GetRelationship('material:binding')
+                    if mat_binding_rel:
+                        targets = mat_binding_rel.GetTargets()
+                        for target in targets:
+                            bound_materials.add(str(target))
             
-            # Remove the unused material scopes and materials
+            # Find all materials in /Root/Looks/
+            all_materials = set()
+            for prim in main_stage.TraverseAll():
+                if prim.IsA(UsdShade.Material) and str(prim.GetPath()).startswith("/Root/Looks/"):
+                    all_materials.add(str(prim.GetPath()))
+            
+            # Remove materials NOT bound in main file
+            materials_to_remove = all_materials - bound_materials
+            materials_removed = 0
+            
             for material_path in materials_to_remove:
                 try:
                     main_stage.RemovePrim(material_path)
                     materials_removed += 1
-                    print(f"CLEANUP Successfully removed unused material/scope from main file: {material_path}")
                 except Exception as e:
-                    print(f"WARNING Could not remove unused material from main file {material_path}: {e}")
+                    print(f"WARNING Could not remove material from main file {material_path}: {e}")
             
             if materials_removed > 0:
-                print(f"CLEANUP Removed {materials_removed} unused materials from main file")
-            else:
-                print(f"CLEANUP No unused materials found to remove in main file")
+                print(f"CLEANUP Removed {materials_removed} unused materials from main file (kept {len(bound_materials)} bound materials)")
+            elif bound_materials:
+                print(f"CLEANUP Kept {len(bound_materials)} materials bound in main file")
                 
         except Exception as e:
-            print(f"WARNING Failed to cleanup unused materials from main file: {e}")
+            print(f"WARNING Failed to cleanup materials from main file: {e}")
             import traceback
             print(f"Details: {traceback.format_exc()}")
 
     # Utility methods
-    def copy_prim_data(self, source_prim, target_stage, target_path, include_materials=True, include_children=True, inline_mode=False):
+    def copy_prim_data(self, source_prim, target_stage, target_path, include_materials=True, include_children=True, inline_mode=False, skip_interpolation_fixes=False):
         """
         Enhanced copy method that properly preserves all mesh data including geometry and UVs.
         This is the single source of truth for all prim copying operations.
@@ -1922,6 +2283,7 @@ class FinalOutputGenerator:
             include_materials: Whether to include material bindings
             include_children: Whether to copy children recursively
             inline_mode: Whether to apply inline-specific filtering (exclude transforms, highlights, etc.)
+            skip_interpolation_fixes: Whether to skip interpolation fixes (preserve original)
         """
         try:
             # Create target prim with same type as source
@@ -1935,6 +2297,10 @@ class FinalOutputGenerator:
             for attr in source_prim.GetAttributes():
                 if not attr.GetName().startswith('__'):
                     try:
+                        # Skip attributes without values
+                        if not attr.HasValue():
+                            continue
+                        
                         value = attr.Get()
                         attr_name = attr.GetName()
                         
@@ -1957,7 +2323,7 @@ class FinalOutputGenerator:
                                 # Never allow constant interpolation for UV coordinates - use vertex instead
                                 if interpolation_value == 'constant':
                                     target_attr.SetMetadata('interpolation', 'vertex')
-                                    print(f"REMIX Corrected UV interpolation: constant→vertex for {attr_name}")
+                                    print(f"REMIX Corrected UV interpolation: constant?�vertex for {attr_name}")
                                 else:
                                     target_attr.SetMetadata('interpolation', interpolation_value)
                             else:
@@ -2038,6 +2404,7 @@ class FinalOutputGenerator:
                             continue
             
             # Copy children recursively if requested
+            has_geomsubsets = False
             if include_children:
                 for child in source_prim.GetAllChildren():
                     child_name = child.GetName()
@@ -2045,19 +2412,27 @@ class FinalOutputGenerator:
                     if not include_materials and child_name in ["_materials", "materials", "Looks"]:
                         continue
                     child_target_path = f"{target_path}/{child_name}"
-                    self.copy_prim_data(child, target_stage, child_target_path, include_materials, include_children)
+                    # Handle GeomSubset with familyName="materialBind" - optionally remove familyName
+                    if child.GetTypeName() == "GeomSubset":
+                        has_geomsubsets = True
+                        if self.remove_geomsubset_familyname:
+                            family_name_attr = child.GetAttribute("familyName")
+                            if family_name_attr and family_name_attr.Get() == "materialBind":
+                                self.geomsubset_fixes += 1
+                                self._copy_geomsubset_without_familyname(child, target_stage, child_target_path, include_materials, skip_interpolation_fixes)
+                                continue
+                    self.copy_prim_data(child, target_stage, child_target_path, include_materials, include_children, inline_mode, skip_interpolation_fixes)
+            
+            # CRITICAL: Remove material:binding from parent mesh if it has GeomSubsets
+            # Only GeomSubsets should have material bindings, not the parent mesh
+            if has_geomsubsets and target_prim.GetRelationship("material:binding"):
+                target_prim.RemoveProperty("material:binding")
             
             # Clean up old Blender materials from prototypes after copying
             if inline_mode:
                 self._remove_old_blender_materials_from_prototype(target_prim)
-            
-            # Also check if this is a prototype that contains old Blender materials and clean it
             elif "Prototype" in target_path and self._contains_old_blender_materials(target_prim):
-                print(f"CLEANUP Detected prototype with old Blender materials: {target_path}")
                 self._remove_old_blender_materials_from_prototype(target_prim)
-            
-            # Apply unified post-copy fixes
-            self._apply_unified_prim_fixes(target_prim)
             
             return target_prim
             
@@ -2065,48 +2440,119 @@ class FinalOutputGenerator:
             print(f"WARNING Failed to copy prim data from {source_prim.GetPath()} to {target_path}: {e}")
             return None
     
-    def _apply_unified_prim_fixes(self, target_prim):
-        """Apply unified fixes to all copied prims - ensures consistency across all conversion types"""
+    def _apply_final_mesh_fixes(self, output_stage):
+        """Apply unified mesh fixes to ALL meshes after structure is complete"""
+        print("REMIX Applying final mesh fixes to all meshes...")
+        mesh_count = 0
+        
+        for prim in output_stage.TraverseAll():
+            if prim.IsA(UsdGeom.Mesh):
+                mesh_count += 1
+                had_uvs_before, uv_generated = self._fix_single_mesh(prim)
+                # Track UV status: if mesh didn't have UVs originally
+                if not had_uvs_before:
+                    if self.generate_missing_uvs:
+                        if uv_generated:
+                            self.meshes_with_generated_uvs.append(str(prim.GetPath()))
+                        else:
+                            self.meshes_failed_uv_generation.append(str(prim.GetPath()))
+                    else:
+                        self.meshes_without_uvs.append(str(prim.GetPath()))
+        
+        print(f"REMIX Applied fixes to {mesh_count} meshes")
+        
+        if self.generate_missing_uvs:
+            if self.meshes_with_generated_uvs:
+                uv_count = len(self.meshes_with_generated_uvs)
+                mesh_word = "mesh" if uv_count == 1 else "meshes"
+                print(f"\nUV Generated placeholder UVs for {uv_count} {mesh_word}:")
+                for mesh_path in self.meshes_with_generated_uvs:
+                    print(f"  - {mesh_path}")
+            if self.meshes_failed_uv_generation:
+                fail_count = len(self.meshes_failed_uv_generation)
+                mesh_word = "mesh" if fail_count == 1 else "meshes"
+                print(f"\nWARNING: Failed to generate UVs for {fail_count} {mesh_word}:")
+                for mesh_path in self.meshes_failed_uv_generation:
+                    print(f"  - {mesh_path}")
+                print("  These meshes may not display textures correctly in RTX Remix.")
+                print("  Consider adding UV mapping in your DCC tool before export.")
+        else:
+            if self.meshes_without_uvs:
+                uv_count = len(self.meshes_without_uvs)
+                mesh_word = "mesh" if uv_count == 1 else "meshes"
+                print(f"\nWARNING: {uv_count} {mesh_word} missing UV coordinates (primvars:st):")
+                for mesh_path in self.meshes_without_uvs:
+                    print(f"  - {mesh_path}")
+                print("  These meshes may not display textures correctly in RTX Remix.")
+                print("  Consider adding UV mapping in your DCC tool before export.")
+    
+    def _fix_single_mesh(self, mesh_prim):
+        """Apply all fixes to a single mesh. Returns (had_uvs_before, uv_generated) tuple."""
+        had_uvs_before = False
+        uv_generated = False
         try:
-            if target_prim.IsA(UsdGeom.Mesh):
-                # Fix UV coordinates using the correct approach from unified_instancer_converter.py
-                # Use the stage-based method that actually works
-                target_stage = target_prim.GetStage()
-                self._convert_float2_primvars_in_stage(target_stage)
-                
-                # Fix ALL attributes with interpolation modes - convert faceVarying to vertex
-                primvar_api = UsdGeom.PrimvarsAPI(target_prim)
+            # Check if this is an empty mesh (anchor mesh) - skip UV tracking for these
+            mesh = UsdGeom.Mesh(mesh_prim)
+            points_attr = mesh.GetPointsAttr()
+            if points_attr and points_attr.HasValue():
+                points = points_attr.Get()
+                if not points or len(points) == 0:
+                    # Empty mesh (anchor) - skip UV tracking entirely
+                    return True, False  # Return True to indicate "had UVs" so it's not tracked
+            
+            # 1. Convert float2 to texCoord2f
+            self._convert_float2_primvars_in_stage(mesh_prim.GetStage())
+            
+            # 2. Check for UV coordinates (primvars:st or texCoord2f[])
+            primvar_api = UsdGeom.PrimvarsAPI(mesh_prim)
+            if primvar_api:
+                for primvar in primvar_api.GetPrimvars():
+                    if primvar:
+                        primvar_name = primvar.GetPrimvarName()
+                        if primvar_name == "st" or "st" in primvar_name:
+                            had_uvs_before = True
+                            break
+            
+            # 2b. Generate UVs if missing and option enabled
+            if not had_uvs_before and self.generate_missing_uvs:
+                uv_generated = self._generate_box_projection_uvs(mesh_prim)
+            
+            # 3. Apply interpolation fixes based on mode
+            if self.interpolation_mode != "none":
                 if primvar_api:
-                    # Get all primvars and fix their interpolation modes
                     for primvar in primvar_api.GetPrimvars():
                         if primvar:
                             current_interpolation = primvar.GetInterpolation()
-                            if current_interpolation == UsdGeom.Tokens.faceVarying:
-                                # Convert faceVarying to vertex for all attributes
-                                primvar.SetInterpolation(UsdGeom.Tokens.vertex)
+                            primvar_name = primvar.GetPrimvarName()
+                            
+                            if self.interpolation_mode == "faceVarying" and current_interpolation == UsdGeom.Tokens.vertex:
+                                if ("st" in primvar_name or "uv" in primvar_name.lower() or "texcoord" in primvar_name.lower()):
+                                    primvar.SetInterpolation(UsdGeom.Tokens.faceVarying)
+                            elif self.interpolation_mode == "vertex" and current_interpolation == UsdGeom.Tokens.faceVarying:
+                                if ("st" in primvar_name or "uv" in primvar_name.lower() or "texcoord" in primvar_name.lower()):
+                                    primvar.SetInterpolation(UsdGeom.Tokens.vertex)
                 
-                # Fix direct attributes that have interpolation modes (like normals)
-                # Use UsdGeom.Mesh API to properly handle normals interpolation
-                mesh = UsdGeom.Mesh(target_prim)
+                mesh = UsdGeom.Mesh(mesh_prim)
                 if mesh:
-                    # Check and fix normals interpolation
                     normals_attr = mesh.GetNormalsAttr()
                     if normals_attr and normals_attr.HasValue():
-                        # Get the current interpolation
                         try:
                             current_normals_interpolation = mesh.GetNormalsInterpolation()
-                            if current_normals_interpolation == UsdGeom.Tokens.faceVarying:
-                                # Use the proper USD API to set normals interpolation
+                            if self.interpolation_mode == "faceVarying" and current_normals_interpolation == UsdGeom.Tokens.vertex:
+                                mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+                            elif self.interpolation_mode == "vertex" and current_normals_interpolation == UsdGeom.Tokens.faceVarying:
                                 mesh.SetNormalsInterpolation(UsdGeom.Tokens.vertex)
-                        except Exception as e:
-                            print(f"WARNING Could not fix normals interpolation: {e}")
-                
-                # Add MaterialBindingAPI for mesh prims
-                target_prim.ApplyAPI(UsdShade.MaterialBindingAPI)
-                target_prim.SetMetadata("kind", "component")
-                
-        except Exception as e:
-            print(f"WARNING Failed to apply unified fixes to {target_prim.GetPath()}: {e}")
+                        except:
+                            pass
+            
+            # 4. Add MaterialBindingAPI
+            mesh_prim.ApplyAPI(UsdShade.MaterialBindingAPI)
+            mesh_prim.SetMetadata("kind", "component")
+            
+        except:
+            pass
+        
+        return had_uvs_before, uv_generated
     
     def _convert_float2_primvars_in_stage(self, stage):
         """Convert all float2[] primvars to texCoord2f[] primvars in a stage - using the reference method"""
@@ -2165,26 +2611,22 @@ class FinalOutputGenerator:
             except Exception as e:
                 print(f"WARNING Failed to copy attribute {attr.GetName()}: {e}")
     
-    def _copy_materials_to_external_stage(self, external_stage, materials):
-        """Copy materials to external stage"""
+    def _copy_materials_to_external_stage(self, external_stage, materials, is_external=False):
+        """Copy materials to external stage with adjusted paths for subfolder"""
         try:
             # Create Looks scope
             looks_scope = external_stage.DefinePrim("/Root/Looks", "Scope")
             
             # Copy materials to external file
             for material_name, material_data in materials.items():
-                material_path = material_data['path']
-                if isinstance(material_path, str):
-                    material_name = material_path.split("/")[-1]
-                else:
-                    material_name = material_data['prim'].GetName()
+                # Use material_name directly from the dictionary key
                 external_material_path = f"/Root/Looks/{material_name}"
                 
                 # Check if this is a Remix material
                 if material_data.get('is_remix', False):
-                     # Create Remix material in external stage
-                     self._create_remix_material(external_stage, external_material_path, material_data, is_external=True)
-                     
+                    # Create Remix material in external stage (is_external=True adjusts paths)
+                    self._create_remix_material(external_stage, external_material_path, material_data, is_external=True)
+                    
                 else:
                     # Create material prim
                     target_material = external_stage.DefinePrim(external_material_path, "Material")
@@ -2230,7 +2672,7 @@ class FinalOutputGenerator:
             self._update_material_bindings_in_external_stage(external_stage)
         except Exception as e:
             print(f"WARNING Failed to copy materials to external stage: {e}")
-     
+    
     def _update_material_bindings_in_external_stage(self, external_stage):
         """Update material bindings in external stage to use correct paths"""
         try:
@@ -2384,6 +2826,19 @@ class FinalOutputGenerator:
             else:
                 return "./materials/AperturePBR_Opacity.usda"
 
+    def _find_mod_file(self):
+        """Find mod.usda file in parent directories"""
+        current_dir = os.path.dirname(os.path.abspath(self.output_path))
+        while current_dir:
+            mod_file = os.path.join(current_dir, "mod.usda")
+            if os.path.exists(mod_file):
+                return mod_file
+            parent = os.path.dirname(current_dir)
+            if parent == current_dir:  # Reached filesystem root
+                return ""
+            current_dir = parent
+        return ""
+    
     def _setup_materials_directory(self):
         """Find project root with mod.usda and setup materials directory"""
         # Find the mod root directory (containing mod.usda)
@@ -2398,7 +2853,7 @@ class FinalOutputGenerator:
         if os.path.exists(os.path.join(mod_root, "mod.usda")):
             # Found project root, materials directory should be here
             materials_dir = os.path.join(mod_root, "materials")
-            print(f"    📁 Found project root with mod.usda: {mod_root}")
+            print(f"     Found project root with mod.usda: {mod_root}")
         else:
             # Fallback: create materials directory relative to assets folder
             output_dir = os.path.dirname(self.output_path)
@@ -2407,9 +2862,9 @@ class FinalOutputGenerator:
                 materials_dir = os.path.join(parent_dir, "materials")
             else:
                 materials_dir = os.path.join(output_dir, "materials")
-            print(f"    📁 No mod.usda found, using fallback materials directory")
+            print(f"     No mod.usda found, using fallback materials directory")
         
-        print(f"    📁 Materials directory: {materials_dir}")
+        print(f"     Materials directory: {materials_dir}")
         os.makedirs(materials_dir, exist_ok=True)
         return materials_dir
 
@@ -2419,48 +2874,271 @@ class FinalOutputGenerator:
         
         # Check if it already exists
         if os.path.exists(target_material_path):
-            print(f"    ✅ AperturePBR_Opacity.usda already exists in {materials_dir}")
+            print(f"     AperturePBR_Opacity.usda already exists in {materials_dir}")
             return
             
         try:
-            # Find the source AperturePBR_Opacity.usda file in the converter directory
-            converter_materials_dir = os.path.join(os.path.dirname(__file__), "materials")
-            source_material_path = os.path.join(converter_materials_dir, "AperturePBR_Opacity.usda")
+            # Find the source AperturePBR_Opacity.usda file - check multiple locations
+            possible_sources = [
+                os.path.join(os.path.dirname(__file__), "materials", "AperturePBR_Opacity.usda"),
+                os.path.join(os.path.dirname(__file__), "Sample Files", "materials", "AperturePBR_Opacity.usda"),
+            ]
             
-            if os.path.exists(source_material_path):
+            source_material_path = None
+            for path in possible_sources:
+                if os.path.exists(path):
+                    source_material_path = path
+                    break
+            
+            if source_material_path:
                 shutil.copy2(source_material_path, target_material_path)
-                print(f"    📄 Copied AperturePBR_Opacity.usda to {materials_dir}")
+                print(f"     Copied AperturePBR_Opacity.usda to {materials_dir}")
             else:
-                print(f"WARNING: Could not find AperturePBR_Opacity.usda at {source_material_path}")
+                print(f"WARNING: Could not find AperturePBR_Opacity.usda in any expected location")
         except Exception as e:
             print(f"WARNING: Failed to copy AperturePBR_Opacity.usda: {e}")
     
     def _clear_texture_conversion_cache(self):
         """Clear texture conversion tracking cache after conversion is complete"""
-        print(f"🧹 Clearing texture conversion cache ({len(self.texture_conversion_cache)} entries)")
+        print(f" Clearing texture conversion cache ({len(self.texture_conversion_cache)} entries)")
         self.texture_conversion_cache.clear()
         self.textures_being_converted.clear()
     
+    def _fix_external_texture_paths(self, external_stage):
+        """Fix texture paths in external files to add ../ prefix since they're in Instance_Objs/ subfolder"""
+        try:
+            for prim in external_stage.TraverseAll():
+                for attr in prim.GetAttributes():
+                    if attr.GetTypeName() == Sdf.ValueTypeNames.Asset:
+                        value = attr.Get()
+                        if value:
+                            path_str = str(value.path) if hasattr(value, 'path') else str(value)
+                            # Fix texture paths: ./textures/ -> ../textures/
+                            if path_str.startswith('./textures/'):
+                                new_path = path_str.replace('./textures/', '../textures/')
+                                attr.Set(Sdf.AssetPath(new_path))
+        except Exception as e:
+            print(f"WARNING Failed to fix external texture paths: {e}")
+    
     def _should_exclude_attribute_for_inline(self, attr_name):
         """Check if an attribute should be excluded for inline prototype meshes"""
-        # 🚫 EXCLUDE: Transform attributes
+        # EXCLUDE: Transform attributes
         transform_attrs = {
             'xformOp:translate', 'xformOp:rotateXYZ', 'xformOp:scale', 'xformOpOrder',
             'xformOp:transform', 'xformOp:rotateX', 'xformOp:rotateY', 'xformOp:rotateZ',
             'xformOp:rotate', 'xformOp:orient', 'xformOp:matrix'
         }
         
-        # 🚫 EXCLUDE: Highlight parameters (not needed for prototype meshes)
+        # EXCLUDE: Highlight parameters (not needed for prototype meshes)
         highlight_attrs = {
             'primvars:displayOpacity', 'primvars:displayColor',
             'primvars:highlight', 'primvars:selection'
         }
         
-        # 🚫 EXCLUDE: Instance-specific attributes
+        # EXCLUDE: Instance-specific attributes
         instance_attrs = {
             'primvars:instanceId', 'primvars:instanceIndex'
         }
         
         return attr_name in transform_attrs or attr_name in highlight_attrs or attr_name in instance_attrs
     
+    def _copy_geomsubset_without_familyname(self, source_prim, target_stage, target_path, include_materials=True, skip_interpolation_fixes=False):
+        """Copy GeomSubset without familyName but WITH material:binding for sub-materials"""
+        try:
+            target_prim = target_stage.DefinePrim(target_path, "GeomSubset")
+            
+            # Copy all attributes EXCEPT familyName
+            for attr in source_prim.GetAttributes():
+                attr_name = attr.GetName()
+                if attr_name.startswith('__') or attr_name == 'familyName':
+                    continue
+                try:
+                    value = attr.Get()
+                    if value is not None:
+                        target_attr = target_prim.CreateAttribute(attr_name, attr.GetTypeName())
+                        target_attr.Set(value)
+                except Exception as e:
+                    print(f"WARNING Could not copy GeomSubset attribute {attr_name}: {e}")
+            
+            # KEEP material:binding for GeomSubsets - needed for sub-materials
+            if include_materials:
+                for rel in source_prim.GetRelationships():
+                    rel_name = rel.GetName()
+                    if rel_name.startswith('__'):
+                        continue
+                    if rel_name == "material:binding":
+                        targets = rel.GetTargets()
+                        if targets:
+                            updated_targets = []
+                            for target in targets:
+                                target_str = str(target)
+                                material_name = None
+                                if "/_materials/" in target_str:
+                                    material_name = target_str.split("/_materials/")[-1]
+                                elif "/root/Looks/" in target_str:
+                                    material_name = target_str.split("/root/Looks/")[-1]
+                                elif "/Root/Looks/" in target_str:
+                                    material_name = target_str.split("/Root/Looks/")[-1]
+                                elif "/Looks/" in target_str:
+                                    material_name = target_str.split("/Looks/")[-1]
+                                
+                                if material_name:
+                                    updated_path = f"/Root/Looks/{material_name}"
+                                    updated_targets.append(Sdf.Path(updated_path))
+                            
+                            if updated_targets:
+                                binding_rel = target_prim.CreateRelationship("material:binding", custom=False)
+                                binding_rel.SetTargets(updated_targets)
+                    else:
+                        try:
+                            target_rel = target_prim.CreateRelationship(rel_name)
+                            targets = rel.GetTargets()
+                            if targets:
+                                target_rel.SetTargets(targets)
+                        except Exception as e:
+                            continue
+            
+            return target_prim
+        except Exception as e:
+            print(f"WARNING Failed to copy GeomSubset: {e}")
+            return None
+    
+    def _assign_all_material_bindings(self, output_stage):
+        """Assign all material bindings at final step (avoids USD warnings)"""
+        if not hasattr(self, '_pending_bindings'):
+            return
+        
+        for prim_path, material_binding in self._pending_bindings:
+            prim = output_stage.GetPrimAtPath(prim_path)
+            if not prim or not prim.IsValid():
+                continue
+            
+            material_binding_api = UsdShade.MaterialBindingAPI(prim)
+            material_path = material_binding.get('target_path', '') if isinstance(material_binding, dict) else str(material_binding)
+            
+            if material_path and material_path.strip():
+                material_name = None
+                if '/_materials/' in material_path:
+                    material_name = material_path.split('/_materials/')[-1]
+                elif '/root/Looks/' in material_path:
+                    material_name = material_path.split('/root/Looks/')[-1]
+                elif '/Root/Looks/' in material_path:
+                    material_name = material_path.split('/Root/Looks/')[-1]
+                elif '/Looks/' in material_path:
+                    material_name = material_path.split('/Looks/')[-1]
+                elif '/root/prototypes/' in material_path:
+                    material_name = material_path.split('/')[-1]
+                
+                if material_name:
+                    material_prim = output_stage.GetPrimAtPath(f"/Root/Looks/{material_name}")
+                    if material_prim:
+                        material_binding_api.Bind(UsdShade.Material(material_prim))
+    
+    def _generate_box_projection_uvs(self, mesh_prim):
+        """Generate simple box projection UVs for mesh without UVs (faceVarying interpolation)"""
+        try:
+            mesh = UsdGeom.Mesh(mesh_prim)
+            points_attr = mesh.GetPointsAttr()
+            face_vertex_indices_attr = mesh.GetFaceVertexIndicesAttr()
+            
+            if not points_attr or not points_attr.HasValue():
+                return False
+            if not face_vertex_indices_attr or not face_vertex_indices_attr.HasValue():
+                return False
+            
+            points = points_attr.Get()
+            face_vertex_indices = face_vertex_indices_attr.Get()
+            
+            # Calculate bounding box
+            min_x = min_y = min_z = float('inf')
+            max_x = max_y = max_z = float('-inf')
+            for point in points:
+                min_x, max_x = min(min_x, point[0]), max(max_x, point[0])
+                min_y, max_y = min(min_y, point[1]), max(max_y, point[1])
+                min_z, max_z = min(min_z, point[2]), max(max_z, point[2])
+            
+            # Avoid division by zero
+            range_x = max_x - min_x if max_x != min_x else 1.0
+            range_y = max_y - min_y if max_y != min_y else 1.0
+            
+            # Generate faceVarying UVs (one UV per face-vertex)
+            uvs = []
+            for vertex_index in face_vertex_indices:
+                point = points[vertex_index]
+                u = (point[0] - min_x) / range_x
+                v = (point[1] - min_y) / range_y
+                uvs.append(Gf.Vec2f(u, v))
+            
+            # Create primvars:st attribute with faceVarying interpolation
+            primvar_api = UsdGeom.PrimvarsAPI(mesh_prim)
+            st_primvar = primvar_api.CreatePrimvar('st', Sdf.ValueTypeNames.TexCoord2fArray)
+            st_primvar.Set(uvs)
+            st_primvar.SetInterpolation(UsdGeom.Tokens.faceVarying)
+            
+            return True
+            
+        except Exception as e:
+            print(f"WARNING Failed to generate UVs for {mesh_prim.GetPath()}: {e}")
+            return False
 
+    def _calculate_face_counts(self, output_stage):
+        """Calculate instance counts and use face counts from data collector"""
+        try:
+            # Build lookup table: mesh_name -> face_count from data collector
+            prototype_meshes = self.output_data.get('prototype_meshes', {})
+            mesh_name_to_face_count = {}
+            for ref_path, proto_data in prototype_meshes.items():
+                proto_name = proto_data['mesh_prim'].GetName()
+                if 'face_count' in proto_data:
+                    mesh_name_to_face_count[proto_name] = proto_data['face_count']
+            
+            # Also add face counts from PointInstancer data (Blender 4.5)
+            for pi_data in self.output_data.get('pointinstancers', []):
+                if 'prototype_face_counts' in pi_data:
+                    for mesh_name, face_count in pi_data['prototype_face_counts'].items():
+                        mesh_name_to_face_count[mesh_name] = face_count
+            
+            print(f"FACES Building lookup table from {len(mesh_name_to_face_count)} mesh face counts")
+            
+            # Count instances per prototype and load face counts
+            for prim in output_stage.TraverseAll():
+                if prim.IsA(UsdGeom.PointInstancer):
+                    pi = UsdGeom.PointInstancer(prim)
+                    proto_indices = pi.GetProtoIndicesAttr().Get()
+                    print(f"FACES Found PointInstancer with {len(proto_indices) if proto_indices else 0} protoIndices")
+                    if proto_indices:
+                        proto_rel = pi.GetPrototypesRel()
+                        if proto_rel:
+                            targets = proto_rel.GetTargets()
+                            print(f"FACES PointInstancer has {len(targets)} prototype targets")
+                            # Count instances per prototype index
+                            proto_instance_counts = {}
+                            for idx in proto_indices:
+                                proto_instance_counts[idx] = proto_instance_counts.get(idx, 0) + 1
+                            print(f"FACES Instance counts per prototype index: {proto_instance_counts}")
+                            
+                            # Store instance counts and load face counts from lookup table
+                            for proto_idx, target in enumerate(targets):
+                                proto_prim = output_stage.GetPrimAtPath(target)
+                                if proto_prim:
+                                    instance_count = proto_instance_counts.get(proto_idx, 0)
+                                    
+                                    # Find the actual mesh inside the prototype container
+                                    mesh_prim = None
+                                    if proto_prim.IsA(UsdGeom.Mesh):
+                                        mesh_prim = proto_prim
+                                    else:
+                                        for desc in Usd.PrimRange.AllPrims(proto_prim):
+                                            if desc.IsA(UsdGeom.Mesh):
+                                                mesh_prim = desc
+                                                break
+                                    
+                                    if mesh_prim:
+                                        mesh_name = mesh_prim.GetName()
+                                        self.instance_counts[mesh_name] = instance_count
+                                        
+                                        # Load face count from lookup table using mesh name
+                                        if mesh_name in mesh_name_to_face_count:
+                                            self.prototype_face_counts[mesh_name] = mesh_name_to_face_count[mesh_name]
+        except Exception as e:
+            print(f"WARNING Failed to calculate face counts: {e}")
