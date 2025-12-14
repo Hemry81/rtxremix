@@ -140,6 +140,9 @@ class FinalOutputGenerator:
         if self.use_external_references:
             external_files_created = self._create_external_files()
             
+            # CLEANUP: Remove standalone meshes that are now in external files
+            self._remove_standalone_meshes_for_external_refs(output_stage)
+            
             # CLEANUP: Remove unused materials from main file after external references are created
             self._remove_unused_materials_from_main_file(output_stage)
 
@@ -199,14 +202,14 @@ class FinalOutputGenerator:
             print(f"WARNING Could not preserve upAxis: {e}")
         
         # Create root prim
-        layer.defaultPrim = "Root"
+        layer.defaultPrim = "RootNode"
         root_layer = output_stage.GetRootLayer()
-        root_spec = Sdf.CreatePrimInLayer(root_layer, "/Root")
+        root_spec = Sdf.CreatePrimInLayer(root_layer, "/RootNode")
         root_spec.typeName = "Xform"
         root_spec.specifier = Sdf.SpecifierDef
         
         # Set kind metadata
-        root_prim = output_stage.GetPrimAtPath("/Root")
+        root_prim = output_stage.GetPrimAtPath("/RootNode")
         root_prim.SetMetadata("kind", "model")
         output_stage.SetDefaultPrim(root_prim)
         
@@ -218,12 +221,12 @@ class FinalOutputGenerator:
             return
         
         # Create materials scope
-        materials_scope = output_stage.DefinePrim("/Root/Looks", "Scope")
+        materials_scope = output_stage.DefinePrim("/RootNode/Looks", "Scope")
         
         # Remix materials are now created inline, no external files needed
         
         for material_name, material_info in self.output_data['materials'].items():
-            target_path = f"/Root/Looks/{material_name}"
+            target_path = f"/RootNode/Looks/{material_name}"
             
             # Check if this is a Remix material
             if material_info.get('is_remix', False):
@@ -459,11 +462,11 @@ class FinalOutputGenerator:
         mesh_name = os.path.basename(mesh_data['path'])
         # Clean the mesh name to avoid path issues
         clean_mesh_name = mesh_name.replace('.', '_')
-        mesh_prim = output_stage.DefinePrim(Sdf.Path(f"/Root/{clean_mesh_name}"), "Xform")
+        mesh_prim = output_stage.DefinePrim(Sdf.Path(f"/RootNode/{clean_mesh_name}"), "Xform")
         
         # If this anchor has a mesh, create the mesh as a child
         if mesh_data['mesh_prim'].IsA(UsdGeom.Mesh):
-            mesh_child_path = f"/Root/{clean_mesh_name}/{clean_mesh_name}_mesh"
+            mesh_child_path = f"/RootNode/{clean_mesh_name}/{clean_mesh_name}_mesh"
             
             # Use the unified copy_prim_data approach for proper UV copying
             self.copy_prim_data(mesh_data['mesh_prim'], output_stage, mesh_child_path)
@@ -487,7 +490,7 @@ class FinalOutputGenerator:
     def _create_single_instance(self, output_stage, instance_data):
         """Create single instance as child of its parent anchor"""
         # Get the parent anchor path
-        parent_path = instance_data.get('parent_path', '/Root')
+        parent_path = instance_data.get('parent_path', '/RootNode')
         instance_name = os.path.basename(instance_data['path'])
         # Clean the instance name to avoid path issues
         clean_instance_name = instance_name.replace('.', '_')
@@ -561,14 +564,14 @@ class FinalOutputGenerator:
                 # For reverse conversion, single instances should be created under their parent containers
                 # The parent path should be the parent container path
                 parent_name = "Cube_001"  # Default parent for this test case
-                unique_object_data['parent_path'] = f"/Root/{parent_name}"
+                unique_object_data['parent_path'] = f"/RootNode/{parent_name}"
                 # Create single instance under its parent anchor
                 self._create_single_instance_under_parent(output_stage, unique_object_data)
     
     def _create_reverse_parent_with_pointinstancers(self, parent_name, parent_data, output_stage):
         """Create parent container and nest PointInstancers under it"""
         # Create parent Xform container
-        target_parent_path = f"/Root/{parent_name}"
+        target_parent_path = f"/RootNode/{parent_name}"
         target_parent = output_stage.DefinePrim(target_parent_path, "Xform")
         
         # Copy parent attributes and transforms
@@ -677,7 +680,7 @@ class FinalOutputGenerator:
                             material_name = material_path.split('/Looks/')[-1]
                         
                         if material_name:
-                            correct_material_path = f"/Root/Looks/{material_name}"
+                            correct_material_path = f"/RootNode/Looks/{material_name}"
                             material_prim = output_stage.GetPrimAtPath(correct_material_path)
                             if material_prim:
                                 material_binding_api.Bind(UsdShade.Material(material_prim))
@@ -747,7 +750,7 @@ class FinalOutputGenerator:
     def _create_single_instance_under_parent(self, output_stage, instance_data):
         """Create single instance under its parent container"""
         # Get the parent path from the instance data
-        parent_path = instance_data.get('parent_path', '/Root')
+        parent_path = instance_data.get('parent_path', '/RootNode')
         instance_name = os.path.basename(instance_data['path'])
         
         # Clean the instance name to avoid path issues (replace dots with underscores)
@@ -784,7 +787,7 @@ class FinalOutputGenerator:
                         material_name = material_path.split('/Looks/')[-1]
                     
                     if material_name:
-                        correct_material_path = f"/Root/Looks/{material_name}"
+                        correct_material_path = f"/RootNode/Looks/{material_name}"
                         material_prim = instance_prim.GetStage().GetPrimAtPath(Sdf.Path(correct_material_path))
                         if material_prim:
                             material_binding_api.Bind(UsdShade.Material(material_prim))
@@ -793,7 +796,7 @@ class FinalOutputGenerator:
     
     def _create_pointinstancer_at_root(self, output_stage, pointinstancer_data):
         """Create PointInstancer at root level (for instances without parent containers)"""
-        instancer_path = f"/Root/{pointinstancer_data['name']}"
+        instancer_path = f"/RootNode/{pointinstancer_data['name']}"
         self._create_pointinstancer_from_data(output_stage, instancer_path, pointinstancer_data)
     
 
@@ -801,8 +804,21 @@ class FinalOutputGenerator:
     def _create_pointinstancer(self, output_stage, pointinstancer_data):
         """Create PointInstancer as child of its parent anchor"""
         # Get the parent anchor path
-        parent_path = pointinstancer_data.get('parent_path', '/Root')
+        parent_path = pointinstancer_data.get('parent_path', '/RootNode')
         instancer_name = os.path.basename(pointinstancer_data['path'])
+        
+        # Store face count and instance count for reporting (use blender_name or prototype_name)
+        proto_name = pointinstancer_data.get('blender_name') or pointinstancer_data.get('prototype_name', 'Unknown')
+        if 'face_count' in pointinstancer_data:
+            self.prototype_face_counts[proto_name] = pointinstancer_data['face_count']
+        if 'positions' in pointinstancer_data:
+            self.instance_counts[proto_name] = len(pointinstancer_data['positions'])
+        elif 'instances' in pointinstancer_data:
+            self.instance_counts[proto_name] = len(pointinstancer_data['instances'])
+        
+        # Store blender_name mapping for UI display
+        if pointinstancer_data.get('blender_name'):
+            self.blender_names[proto_name] = pointinstancer_data['blender_name']
         
         # Create PointInstancer under its parent anchor
         instancer_path = f"{parent_path}/{instancer_name}"
@@ -812,11 +828,16 @@ class FinalOutputGenerator:
         prototype_mesh = pointinstancer_data.get('prototype_mesh') or pointinstancer_data.get('prototype_prim')
         if self.use_external_references and prototype_mesh:
             # External reference - create Xform with external reference (like Sample_reference_prototypes.usda)
-            prototype_name = prototype_mesh.GetName()
+            # Use blenderName:object if available (for reverse conversion), otherwise use mesh name
+            blender_name = pointinstancer_data.get('blender_name')
+            if blender_name:
+                prototype_name = self._generate_clean_filename(blender_name)
+            else:
+                prototype_name = prototype_mesh.GetName()
             # Create prototype directly inside the PointInstancer
             prototype_path = f"{instancer_path}/{prototype_name}"
             
-            # Create Xform with external reference (not Mesh)
+            # Create Xform with external reference (not Mesh) - NO inline mesh
             prototype_prim = output_stage.DefinePrim(prototype_path, "Xform")
             prototype_prim.SetMetadata("kind", "component")
             
@@ -827,7 +848,8 @@ class FinalOutputGenerator:
             
             # Set as prototype target
             instancer.GetPrototypesRel().AddTarget(prototype_path)
-            
+            # CRITICAL: Skip inline mesh creation entirely when using external references
+            prototype_mesh = None  # Prevent inline mesh creation below
 
         elif prototype_mesh:
             # Inline prototype - create prototype as child of PointInstancer
@@ -869,7 +891,7 @@ class FinalOutputGenerator:
                                     material_name = parts[-1]  # Get the material name from the end
                             
                             if material_name:
-                                updated_target = f"/Root/Looks/{material_name}"
+                                updated_target = f"/RootNode/Looks/{material_name}"
                                 updated_targets.append(updated_target)
                             else:
                                 # Keep original if not in expected format
@@ -913,8 +935,8 @@ class FinalOutputGenerator:
             proto_indices = []
             
             # Check if we need to convert from world space to parent-relative space
-            parent_path = pointinstancer_data.get('parent_path', '/Root')
-            has_parent_container = parent_path != '/Root'
+            parent_path = pointinstancer_data.get('parent_path', '/RootNode')
+            has_parent_container = parent_path != '/RootNode'
             
             parent_world_transform_inverse = None
             if has_parent_container:
@@ -1041,7 +1063,7 @@ class FinalOutputGenerator:
                 targets = source_prototypes.GetTargets()
                 if targets:
                     # Standardize paths from /root/ to /Root/
-                    updated_targets = [Sdf.Path(str(t).replace('/root/', '/Root/')) for t in targets]
+                    updated_targets = [Sdf.Path(str(t).replace('/root/', '/RootNode/')) for t in targets]
                     target_prototypes.SetTargets(updated_targets)
             
     
@@ -1168,9 +1190,9 @@ class FinalOutputGenerator:
                                                 print(f"CLEANUP Removed old prototype Xform: {child_name}")
                                 else:
                                     # Just fix paths for inline mode
-                                    new_targets = [Sdf.Path(str(t).replace('/root/', '/Root/')) for t in old_targets]
+                                    new_targets = [Sdf.Path(str(t).replace('/root/', '/RootNode/')) for t in old_targets]
                                     proto_rel.SetTargets(new_targets)
-                                    print(f"CLEANUP Fixed prototype paths: /root/ ??/Root/")
+                                    print(f"CLEANUP Fixed prototype paths: /root/ ??/RootNode/")
                         
                         
                         # Remove extra prototype reference objects (Plane_001_64255959, etc.)
@@ -1258,10 +1280,10 @@ class FinalOutputGenerator:
                     
                     # Set up stage structure
                     UsdGeom.SetStageUpAxis(external_stage, UsdGeom.Tokens.z)
-                    layer.defaultPrim = "Root"
+                    layer.defaultPrim = "RootNode"
                     
                     # Create root
-                    root_prim = external_stage.DefinePrim("/Root", "Xform")
+                    root_prim = external_stage.DefinePrim("/RootNode", "Xform")
                     root_prim.SetMetadata("kind", "model")
                     external_stage.SetDefaultPrim(root_prim)
                     
@@ -1269,12 +1291,12 @@ class FinalOutputGenerator:
                     self._copy_materials_to_external_stage(external_stage, self.output_data['materials'], is_external=True)
                     
                     # Create prototype container Xform
-                    prototype_container = external_stage.DefinePrim("/Root/prototype", "Xform")
+                    prototype_container = external_stage.DefinePrim("/RootNode/prototype", "Xform")
                     prototype_container.SetMetadata("kind", "component")
                     
                     # Copy prototype data with materials enabled AND transform
                     prototype_name = external_prototype_data['prim'].GetName()
-                    prototype_path = f"/Root/prototype/{prototype_name}"
+                    prototype_path = f"/RootNode/prototype/{prototype_name}"
                     copied_prim = self.copy_prim_data(external_prototype_data['prim'], external_stage, prototype_path, include_materials=True, include_children=True)
                     
                     # Apply transform from original prototype if it exists
@@ -1285,10 +1307,7 @@ class FinalOutputGenerator:
                             xformable.AddTransformOp().Set(transform)
                             print(f"TRANSFORM Applied transform to external prototype {prototype_name}")
                     
-                    # Face count already collected in data collector, stored in external_prototype_data
-                    if 'face_count' in external_prototype_data:
-                        self.prototype_face_counts[prototype_name] = external_prototype_data['face_count']
-                        print(f"FACES Loaded face count for external {prototype_name}: {external_prototype_data['face_count']} faces")
+                    # Skip loading face counts from external files - already loaded from pointinstancer_data
                     
                     # Remove unused materials (keep only materials bound to meshes in this file)
                     self._remove_unused_materials_from_external_file(external_stage)
@@ -1330,7 +1349,7 @@ class FinalOutputGenerator:
             print(f"WARNING: _create_existing_pointinstancer called for Blender 4.5 PointInstancer - should be handled in _create_pointinstancers")
             return
         
-        parent_path = pointinstancer_data.get('parent_path', '/Root')
+        parent_path = pointinstancer_data.get('parent_path', '/RootNode')
         instancer_name = pointinstancer_data['name']
         instancer_path = f"{parent_path}/{instancer_name}"
         
@@ -1345,26 +1364,66 @@ class FinalOutputGenerator:
             pi = UsdGeom.PointInstancer(copied_instancer)
             prototypes_rel = pi.GetPrototypesRel()
             
-            # Find prototype children and update the relationship
-            prototype_paths = []
-            for child in copied_instancer.GetAllChildren():
-                child_name = child.GetName()
-                # Look for prototype-like children (Prototype_*, Prototypes folder, or mesh children)
-                if child_name.startswith('Prototype_') or child_name == 'Prototypes':
-                    if child_name == 'Prototypes':
-                        # Look inside the Prototypes folder
-                        for prot_child in child.GetAllChildren():
-                            prototype_paths.append(prot_child.GetPath())
-                    else:
+            # If using external references, replace inline prototypes with external Xforms
+            if self.use_external_references:
+                old_targets = prototypes_rel.GetTargets()
+                new_targets = []
+                
+                for old_target in old_targets:
+                    # Get the mesh from the old target
+                    old_prim = output_stage.GetPrimAtPath(old_target)
+                    if old_prim and old_prim.IsValid():
+                        mesh_prim = None
+                        if old_prim.IsA(UsdGeom.Mesh):
+                            mesh_prim = old_prim
+                            mesh_name = mesh_prim.GetName()
+                        else:
+                            # Search for mesh in children
+                            for desc in Usd.PrimRange.AllPrims(old_prim):
+                                if desc.IsA(UsdGeom.Mesh):
+                                    mesh_prim = desc
+                                    mesh_name = mesh_prim.GetName()
+                                    break
+                        
+                        if mesh_prim:
+                            # Remove the inline mesh
+                            output_stage.RemovePrim(old_target)
+                            
+                            # Create Xform with external reference
+                            ext_ref_path = f"{instancer_path}/{mesh_name}"
+                            ext_ref_prim = output_stage.DefinePrim(ext_ref_path, "Xform")
+                            ext_ref_prim.SetMetadata("kind", "component")
+                            
+                            external_file = f"./Instance_Objs/{mesh_name}.usd"
+                            references = ext_ref_prim.GetReferences()
+                            references.AddReference(external_file)
+                            
+                            new_targets.append(Sdf.Path(ext_ref_path))
+                
+                if new_targets:
+                    prototypes_rel.SetTargets(new_targets)
+                    print(f"    Updated prototypes relationship to: {[str(p) for p in new_targets]}")
+            else:
+                # Inline mode - just update paths
+                prototype_paths = []
+                for child in copied_instancer.GetAllChildren():
+                    child_name = child.GetName()
+                    # Look for prototype-like children (Prototype_*, Prototypes folder, or mesh children)
+                    if child_name.startswith('Prototype_') or child_name == 'Prototypes':
+                        if child_name == 'Prototypes':
+                            # Look inside the Prototypes folder
+                            for prot_child in child.GetAllChildren():
+                                prototype_paths.append(prot_child.GetPath())
+                        else:
+                            prototype_paths.append(child.GetPath())
+                    elif child.IsA(UsdGeom.Mesh):
+                        # Direct mesh children can also be prototypes
                         prototype_paths.append(child.GetPath())
-                elif child.IsA(UsdGeom.Mesh):
-                    # Direct mesh children can also be prototypes
-                    prototype_paths.append(child.GetPath())
-            
-            # Set the prototypes relationship to point to the copied children
-            if prototype_paths:
-                prototypes_rel.SetTargets(prototype_paths)
-                print(f"    Updated prototypes relationship to: {[str(p) for p in prototype_paths]}")
+                
+                # Set the prototypes relationship to point to the copied children
+                if prototype_paths:
+                    prototypes_rel.SetTargets(prototype_paths)
+                    print(f"    Updated prototypes relationship to: {[str(p) for p in prototype_paths]}")
             
             # Now recursively update only the material and texture paths in the copied structure
             self._update_material_texture_paths_recursive(copied_instancer, output_stage)
@@ -1393,7 +1452,7 @@ class FinalOutputGenerator:
                         material_name = target_str.split("/Looks/")[-1]
                     
                     if material_name:
-                        updated_path = f"/Root/Looks/{material_name}"
+                        updated_path = f"/RootNode/Looks/{material_name}"
                         updated_targets.append(Sdf.Path(updated_path))
                     else:
                         updated_targets.append(target)
@@ -2020,7 +2079,7 @@ class FinalOutputGenerator:
                                         material_name = target_str.split("/Looks/")[-1]
                                     
                                     if material_name:
-                                        updated_path = f"/Root/Looks/{material_name}"
+                                        updated_path = f"/RootNode/Looks/{material_name}"
                                         updated_targets.append(Sdf.Path(updated_path))
                                 
                                 if updated_targets:
@@ -2051,7 +2110,7 @@ class FinalOutputGenerator:
             print(f"WARNING Failed to copy geometry comprehensively: {e}")
     
     def _remove_old_blender_materials_from_prototype(self, prototype_prim):
-        """Remove old Blender material scopes from prototypes since we now have RTX Remix materials in /Root/Looks"""
+        """Remove old Blender material scopes from prototypes since we now have RTX Remix materials in /RootNode/Looks"""
         try:
             materials_to_remove = []
             
@@ -2097,11 +2156,11 @@ class FinalOutputGenerator:
                     break
             
             if old_materials_scope:
-                # Verify that RTX Remix materials exist in /Root/Looks before removing old ones
+                # Verify that RTX Remix materials exist in /RootNode/Looks before removing old ones
                 rtx_materials_exist = False
                 for prim in output_stage.TraverseAll():
                     if (prim.IsA(UsdShade.Material) and 
-                        "/Root/Looks/" in str(prim.GetPath())):
+                        "/RootNode/Looks/" in str(prim.GetPath())):
                         rtx_materials_exist = True
                         break
                 
@@ -2147,10 +2206,10 @@ class FinalOutputGenerator:
     def _remove_unused_materials_from_external_file(self, external_stage):
         """Remove materials from external file that are not bound to any mesh in this file"""
         try:
-            # Find all materials in /Root/Looks/
+            # Find all materials in /RootNode/Looks/
             all_materials = set()
             for prim in external_stage.TraverseAll():
-                if prim.IsA(UsdShade.Material) and str(prim.GetPath()).startswith("/Root/Looks/"):
+                if prim.IsA(UsdShade.Material) and str(prim.GetPath()).startswith("/RootNode/Looks/"):
                     all_materials.add(str(prim.GetPath()))
             
             # Find materials actually used by meshes/GeomSubsets in this file
@@ -2174,29 +2233,29 @@ class FinalOutputGenerator:
             print(f"WARNING Failed to cleanup unused materials from external file: {e}")
     
     def _remove_unused_materials_from_external_stage(self, external_stage):
-        """Remove unused materials from external stage - keep only /Root/Looks/ materials"""
+        """Remove unused materials from external stage - keep only /RootNode/Looks/ materials"""
         try:
             print("CLEANUP Removing unused materials from external stage...")
             
             materials_removed = 0
             materials_to_remove = []
             
-            # Remove ALL duplicate material scopes from external stage - we only want /Root/Looks/
+            # Remove ALL duplicate material scopes from external stage - we only want /RootNode/Looks/
             # The problem is that USD composition creates namespace collisions
             for prim in external_stage.TraverseAll():
                 prim_path_str = str(prim.GetPath())
                 
-                # We want to remove ALL /Root/Looks/ materials since they create problems in composition
-                # Only the main file should have /Root/Looks/ materials
-                if (prim_path_str.startswith("/Root/Looks/") and 
-                    prim_path_str != "/Root/Looks"):
+                # We want to remove ALL /RootNode/Looks/ materials since they create problems in composition
+                # Only the main file should have /RootNode/Looks/ materials
+                if (prim_path_str.startswith("/RootNode/Looks/") and 
+                    prim_path_str != "/RootNode/Looks"):
                     
                     materials_to_remove.append(prim.GetPath())
                     print(f"CLEANUP Found duplicate material in external file: {prim_path_str}")
                 
-                # Also remove the entire /Root/Looks scope if it exists
+                # Also remove the entire /RootNode/Looks scope if it exists
                 elif (prim.GetName() == "Looks" and 
-                    prim_path_str == "/Root/Looks"):
+                    prim_path_str == "/RootNode/Looks"):
                     
                     materials_to_remove.append(prim.GetPath())
                     print(f"CLEANUP Found entire Looks scope to remove: {prim_path_str}")
@@ -2217,6 +2276,75 @@ class FinalOutputGenerator:
                 
         except Exception as e:
             print(f"WARNING Failed to cleanup materials from external stage: {e}")
+            import traceback
+            print(f"Details: {traceback.format_exc()}")
+
+    def _remove_standalone_meshes_for_external_refs(self, main_stage):
+        """Remove standalone meshes from main file when they're now in external files"""
+        try:
+            meshes_to_remove = []
+            
+            # Find all standalone meshes at /Root level (not inside PointInstancers)
+            root_prim = main_stage.GetPrimAtPath('/RootNode')
+            if not root_prim or not root_prim.IsValid():
+                return
+            
+            for prim in root_prim.GetChildren():
+                # Skip PointInstancers and Looks
+                if prim.IsA(UsdGeom.PointInstancer) or prim.GetName() == 'Looks':
+                    continue
+                
+                # Skip anchor meshes that have PointInstancer children (they are parent containers)
+                has_pointinstancer_child = False
+                for child in prim.GetChildren():
+                    if child.IsA(UsdGeom.PointInstancer):
+                        has_pointinstancer_child = True
+                        break
+                if has_pointinstancer_child:
+                    continue
+                
+                # Check if this prim contains a mesh (either is a mesh or has mesh children)
+                has_mesh = False
+                if prim.IsA(UsdGeom.Mesh):
+                    has_mesh = True
+                else:
+                    for child in prim.GetAllChildren():
+                        if child.IsA(UsdGeom.Mesh):
+                            has_mesh = True
+                            break
+                
+                # If it has a mesh and matches branch naming pattern, mark for removal
+                if has_mesh:
+                    prim_name = prim.GetName()
+                    # Check if this mesh is referenced by any PointInstancer
+                    is_referenced = False
+                    for pi_prim in main_stage.TraverseAll():
+                        if pi_prim.IsA(UsdGeom.PointInstancer):
+                            pi = UsdGeom.PointInstancer(pi_prim)
+                            proto_rel = pi.GetPrototypesRel()
+                            if proto_rel:
+                                for target in proto_rel.GetTargets():
+                                    # Check if this standalone mesh is used as a prototype
+                                    if str(target).endswith(prim_name):
+                                        is_referenced = True
+                                        break
+                        if is_referenced:
+                            break
+                    
+                    # If not referenced by any PointInstancer, it's a standalone mesh to remove
+                    if not is_referenced:
+                        meshes_to_remove.append(prim.GetPath())
+            
+            # Remove the standalone meshes
+            for mesh_path in meshes_to_remove:
+                main_stage.RemovePrim(mesh_path)
+                print(f"CLEANUP Removed standalone mesh: {mesh_path.name}")
+            
+            if meshes_to_remove:
+                print(f"CLEANUP Removed {len(meshes_to_remove)} standalone meshes (now in external files)")
+        
+        except Exception as e:
+            print(f"WARNING Failed to remove standalone meshes: {e}")
             import traceback
             print(f"Details: {traceback.format_exc()}")
 
@@ -2243,10 +2371,10 @@ class FinalOutputGenerator:
                         for target in targets:
                             bound_materials.add(str(target))
             
-            # Find all materials in /Root/Looks/
+            # Find all materials in /RootNode/Looks/
             all_materials = set()
             for prim in main_stage.TraverseAll():
-                if prim.IsA(UsdShade.Material) and str(prim.GetPath()).startswith("/Root/Looks/"):
+                if prim.IsA(UsdShade.Material) and str(prim.GetPath()).startswith("/RootNode/Looks/"):
                     all_materials.add(str(prim.GetPath()))
             
             # Remove materials NOT bound in main file
@@ -2374,7 +2502,7 @@ class FinalOutputGenerator:
                                             material_name = target_str.split("/Looks/")[-1]
                                         
                                         if material_name:
-                                            updated_path = f"/Root/Looks/{material_name}"
+                                            updated_path = f"/RootNode/Looks/{material_name}"
                                             updated_targets.append(Sdf.Path(updated_path))
                                     
                                     if updated_targets:
@@ -2615,12 +2743,12 @@ class FinalOutputGenerator:
         """Copy materials to external stage with adjusted paths for subfolder"""
         try:
             # Create Looks scope
-            looks_scope = external_stage.DefinePrim("/Root/Looks", "Scope")
+            looks_scope = external_stage.DefinePrim("/RootNode/Looks", "Scope")
             
             # Copy materials to external file
             for material_name, material_data in materials.items():
                 # Use material_name directly from the dictionary key
-                external_material_path = f"/Root/Looks/{material_name}"
+                external_material_path = f"/RootNode/Looks/{material_name}"
                 
                 # Check if this is a Remix material
                 if material_data.get('is_remix', False):
@@ -2699,7 +2827,7 @@ class FinalOutputGenerator:
                                     material_name = target_str.split('/Looks/')[-1]
                                 
                                 if material_name:
-                                    updated_target = f"/Root/Looks/{material_name}"
+                                    updated_target = f"/RootNode/Looks/{material_name}"
                                     updated_targets.append(updated_target)
 
                                 else:
@@ -2983,7 +3111,7 @@ class FinalOutputGenerator:
                                     material_name = target_str.split("/Looks/")[-1]
                                 
                                 if material_name:
-                                    updated_path = f"/Root/Looks/{material_name}"
+                                    updated_path = f"/RootNode/Looks/{material_name}"
                                     updated_targets.append(Sdf.Path(updated_path))
                             
                             if updated_targets:
@@ -3030,9 +3158,23 @@ class FinalOutputGenerator:
                     material_name = material_path.split('/')[-1]
                 
                 if material_name:
-                    material_prim = output_stage.GetPrimAtPath(f"/Root/Looks/{material_name}")
+                    material_prim = output_stage.GetPrimAtPath(f"/RootNode/Looks/{material_name}")
                     if material_prim:
                         material_binding_api.Bind(UsdShade.Material(material_prim))
+    
+    def _generate_clean_filename(self, name):
+        """Generate clean filename from name"""
+        if not name:
+            return "Mesh"
+        import re
+        clean_name = re.sub(r'[^a-zA-Z0-9_]', '_', str(name))
+        clean_name = re.sub(r'_+', '_', clean_name)
+        clean_name = clean_name.strip('_')
+        if not clean_name:
+            clean_name = "Mesh"
+        if clean_name[0].isdigit():
+            clean_name = f"_{clean_name}"
+        return clean_name
     
     def _generate_box_projection_uvs(self, mesh_prim):
         """Generate simple box projection UVs for mesh without UVs (faceVarying interpolation)"""

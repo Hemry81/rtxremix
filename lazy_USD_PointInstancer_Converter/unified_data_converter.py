@@ -236,28 +236,28 @@ class UnifiedDataConverter:
                     
                     pointinstancer_data = {
                         'type': 'pointinstancer',
-                        'path': f"/Root/{anchor_name}/{pi_name}",
+                        'path': f"/RootNode/{anchor_name}/{pi_name}",
                         'name': pi_name,
                         'blender_name': blender_name,  # Store for reporting
                         'prototype_mesh': self.unified_data['prototype_meshes'][ref_path]['mesh_prim'],
                         'prototype_name': self.unified_data['prototype_meshes'][ref_path]['mesh_prim'].GetName(),
                         'instances': instances,
                         'parent_anchor': anchor_data,  # Store parent anchor information
-                        'parent_path': f"/Root/{anchor_name}"  # Path where this PointInstancer should be created
+                        'parent_path': f"/RootNode/{anchor_name}"  # Path where this PointInstancer should be created
                     }
                     self.output_data['pointinstancers'].append(pointinstancer_data)
                 else:
                     # Single instance - create as unique object
                     single_instance_data = {
                         'type': 'single_instance',
-                        'path': f"/Root/{anchor_name}/{instances[0]['blender_name'] or 'SingleInstance'}",
+                        'path': f"/RootNode/{anchor_name}/{instances[0]['blender_name'] or 'SingleInstance'}",
                         'mesh_prim': self.unified_data['prototype_meshes'][ref_path]['mesh_prim'],
                         'translate': instances[0]['translate'],
                         'rotate': instances[0]['rotate'],
                         'scale': instances[0]['scale'],
                         'material_binding': self.unified_data['prototype_meshes'][ref_path]['material_binding'],
                         'parent_anchor': anchor_data,  # Store parent anchor information
-                        'parent_path': f"/Root/{anchor_name}"  # Path where this single instance should be created
+                        'parent_path': f"/RootNode/{anchor_name}"  # Path where this single instance should be created
                     }
                     self.output_data['unique_objects'].append(single_instance_data)
             
@@ -265,7 +265,7 @@ class UnifiedDataConverter:
             if not anchor_data.get('is_virtual_root', False) and anchor_data['mesh_prim'] is not None:
                 anchor_object_data = {
                     'type': 'anchor_mesh',
-                    'path': f"/Root/{anchor_name}",
+                    'path': f"/RootNode/{anchor_name}",
                     'mesh_prim': anchor_data['mesh_prim'],
                     'transform': anchor_data['transform'],
                     'material_binding': anchor_data['material_binding'],
@@ -328,7 +328,7 @@ class UnifiedDataConverter:
             if len(instances) > 1:
                 # Get parent name from parent_objects
                 parent_name = self.unified_data.get('parent_objects', {}).get(data_name, 'Root')
-                parent_path = f"/Root/{parent_name}" if parent_name != 'Root' else "/Root"
+                parent_path = f"/RootNode/{parent_name}" if parent_name != 'RootNode' else "/RootNode"
                 
                 # Create PointInstancer data
                 pointinstancer_data = self._create_reverse_pointinstancer_data(
@@ -360,7 +360,7 @@ class UnifiedDataConverter:
                         'type': 'single_instance',
                         'path': unique_obj['path'],
                         'mesh_prim': unique_obj['mesh_prim'],
-                        'parent_path': unique_obj.get('parent_path', '/Root'),
+                        'parent_path': unique_obj.get('parent_path', '/RootNode'),
                         'material_binding': unique_obj.get('material_binding')
                     }
                     self.output_data['unique_objects'].append(individual_data)
@@ -380,7 +380,7 @@ class UnifiedDataConverter:
                     # Anchor mesh - create as parent container
                     anchor_data = {
                         'type': 'anchor_mesh',
-                        'path': f"/Root/{unique_obj['mesh_prim'].GetName()}",
+                        'path': f"/RootNode/{unique_obj['mesh_prim'].GetName()}",
                         'mesh_prim': unique_obj['mesh_prim'],
                         'transform': unique_obj.get('transform'),
                         'material_binding': unique_obj.get('material_binding')
@@ -391,9 +391,9 @@ class UnifiedDataConverter:
                     # Individual mesh - create as single instance
                     individual_data = {
                         'type': 'single_instance',
-                        'path': f"/Root/{unique_obj['mesh_prim'].GetName()}",
+                        'path': f"/RootNode/{unique_obj['mesh_prim'].GetName()}",
                         'mesh_prim': unique_obj['mesh_prim'],
-                        'parent_path': unique_obj.get('parent_path', '/Root'),
+                        'parent_path': unique_obj.get('parent_path', '/RootNode'),
                         'material_binding': unique_obj.get('material_binding')
                     }
                     self.output_data['unique_objects'].append(individual_data)
@@ -403,7 +403,7 @@ class UnifiedDataConverter:
             unique_object_data = {
                 'type': 'base_geometry',
                 'prim': geom_data['prim'],
-                'path': f"/Root/{geom_data['prim'].GetName()}"
+                'path': f"/RootNode/{geom_data['prim'].GetName()}"
             }
             self.output_data['unique_objects'].append(unique_object_data)
     
@@ -471,7 +471,7 @@ class UnifiedDataConverter:
         return {
             'type': 'pointinstancer',
             'name': name,
-            'path': f"/Root/{name}",
+            'path': f"/RootNode/{name}",
             'conversion_type': conversion_type,
             'prototype_prim': prototype_prim,
             'prototype_name': self._generate_clean_filename(prototype_prim.GetName()),
@@ -489,7 +489,7 @@ class UnifiedDataConverter:
                 'type': 'unique_object',
                 'conversion_type': conversion_type,
                 'prim': instance['ref_prim'],
-                'path': f"/Root/{self._generate_clean_filename(instance['ref_prim'].GetName())}",
+                'path': f"/RootNode/{self._generate_clean_filename(instance['ref_prim'].GetName())}",
                 'transform': instance['transform']
             }
         elif conversion_type == 'reverse':
@@ -511,11 +511,18 @@ class UnifiedDataConverter:
                 'transform': transform
             }
     
-    def _create_reverse_pointinstancer_data(self, data_name, instances, prototype_prim, parent_path='/Root'):
+    def _create_reverse_pointinstancer_data(self, data_name, instances, prototype_prim, parent_path='/RootNode'):
         """Create PointInstancer data for reverse conversion"""
+        # Get blenderName:object from first instance if available (for external file naming)
+        blender_name = None
+        if instances and instances[0].get('transform_prim'):
+            blender_name_attr = instances[0]['transform_prim'].GetAttribute('blenderName:object')
+            if blender_name_attr and blender_name_attr.HasValue():
+                blender_name = blender_name_attr.Get()
+        
         # Get parent anchor transform to convert world space to local space
         parent_transform = Gf.Matrix4d(1.0)  # Identity by default
-        if parent_path != '/Root':
+        if parent_path != '/RootNode':
             # Extract parent prim from path
             parent_prim = instances[0]['transform_prim'].GetStage().GetPrimAtPath(parent_path)
             if parent_prim and parent_prim.IsValid():
@@ -575,15 +582,29 @@ class UnifiedDataConverter:
                 scales.append(Gf.Vec3f(1, 1, 1))
         
         # Create PointInstancer data
-        clean_name = self._generate_clean_filename(data_name)
+        # Use blenderName:object if available, otherwise fall back to data_name
+        clean_name = self._generate_clean_filename(blender_name if blender_name else data_name)
         if not clean_name:  # Fallback if name is empty
             clean_name = "Mesh"
+        
+        # Get face count from prototype mesh
+        face_count = 0
+        try:
+            mesh = UsdGeom.Mesh(prototype_prim)
+            face_counts_attr = mesh.GetFaceVertexCountsAttr().Get()
+            if face_counts_attr:
+                face_count = len(face_counts_attr)
+        except:
+            pass
+        
         pointinstancer_data = {
             'type': 'pointinstancer',
             'name': f"{clean_name}_instancer",
             'path': f"{parent_path}/{clean_name}_instancer",
             'prototype_mesh': prototype_prim,
             'prototype_name': clean_name,
+            'blender_name': blender_name,  # Store for external file naming
+            'face_count': face_count,  # Store face count for reporting
             'positions': positions,
             'orientations': orientations,
             'scales': scales,
@@ -599,12 +620,12 @@ class UnifiedDataConverter:
         return {
             'type': 'existing_pointinstancer',
             'name': instancer_data['name'],
-            'path': f"/Root/{instancer_data['name']}",
+            'path': f"/RootNode/{instancer_data['name']}",
             'prim': instancer_data['prim'],
             'prototype_prim': instancer_data.get('prototype_prim'),
             'prototype_name': self._generate_clean_filename(instancer_data.get('prototype_prim', instancer_data['prim']).GetName()) if instancer_data.get('prototype_prim') else None,
             'preserve_parent': instancer_data.get('preserve_parent', False),
-            'parent_path': instancer_data.get('parent_path', '/Root'),
+            'parent_path': instancer_data.get('parent_path', '/RootNode'),
             'prototype_face_counts': instancer_data.get('prototype_face_counts', {})  # Pass through face counts
         }
     
@@ -682,10 +703,18 @@ class UnifiedDataConverter:
                 # Handle both prototype_prim and prototype_mesh keys for other types
                 prototype_prim = pointinstancer_data.get('prototype_prim') or pointinstancer_data.get('prototype_mesh')
                 if prototype_prim:
-                    # Generate prototype name if not available
-                    prototype_name = pointinstancer_data.get('prototype_name')
-                    if not prototype_name:
-                        prototype_name = self._generate_clean_filename(prototype_prim.GetName())
+                    # Use blender_name if available, otherwise use prototype_name
+                    blender_name = pointinstancer_data.get('blender_name')
+                    if blender_name:
+                        prototype_name = self._generate_clean_filename(blender_name)
+                    else:
+                        prototype_name = pointinstancer_data.get('prototype_name')
+                        if not prototype_name:
+                            prototype_name = self._generate_clean_filename(prototype_prim.GetName())
+                    
+                    # Skip if already added (avoid duplicates)
+                    if any(ep['name'] == prototype_name for ep in self.output_data['external_prototypes']):
+                        continue
                     
                     # Get only materials used by this mesh
                     mesh_materials = self._get_materials_for_prim(prototype_prim)

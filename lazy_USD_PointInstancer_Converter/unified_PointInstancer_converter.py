@@ -4,6 +4,8 @@ Clean Unified USD PointInstancer Converter
 Uses separate classes for data collection and output generation
 """
 
+VERSION = "0.2.1"
+
 import os
 import sys
 import contextlib

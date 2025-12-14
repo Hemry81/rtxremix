@@ -10,12 +10,12 @@ import os
 import json
 import threading
 import subprocess
-from unified_PointInstancer_converter import CleanUnifiedConverter
+from unified_PointInstancer_converter import CleanUnifiedConverter, VERSION
 
 class UnifiedConverterUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("lazy_USD_PointInstancer_Converter")
+        self.root.title(f"lazy_USD_PointInstancer_Converter v{VERSION}")
         self.root.geometry("1024x1024")
         self.root.configure(bg='#1a1a1a')
         self.root.resizable(True, True)
@@ -120,7 +120,7 @@ class UnifiedConverterUI:
         header_frame = tk.Frame(self.root, bg='#1a1a1a')
         header_frame.pack(fill='x', padx=10, pady=(10, 0))
         
-        title_label = tk.Label(header_frame, text="lazy_USD_PointInstancer_Converter", 
+        title_label = tk.Label(header_frame, text=f"lazy_USD_PointInstancer_Converter v{VERSION}", 
                             bg='#1a1a1a', fg='#76b900',
                             font=('Segoe UI', 16, 'bold'))
         title_label.pack()
